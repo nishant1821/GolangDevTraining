@@ -1,7 +1,10 @@
 // Package checker performs a single HTTP health-check against one URL.
-// It returns a domain.Check (status code, response time, up/down, error message).
-// Each check runs with a per-request context timeout so a slow server
-// cannot hold a worker goroutine indefinitely.
 //
-// Built in Stage 3.
+// Public surface (what other packages use):
+//
+//	type Checker interface { Check(ctx, url) Result }
+//	type Result struct { StatusCode, LatencyMs, Up, Err }
+//
+// Private implementation: HTTPChecker — uses net/http with context-bound requests.
+// Tests inject a fake that satisfies Checker without making real HTTP calls.
 package checker

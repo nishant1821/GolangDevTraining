@@ -1,0 +1,45 @@
+# .air.toml — Air live-reload config for Pulse
+# Docs: https://github.com/air-verse/air
+#
+# Air kya karta hai:
+#   1. tumhare .go files watch karta hai
+#   2. koi bhi change hone par: purana server band karta hai
+#   3. go build karta hai
+#   4. naya binary chalata hai
+#
+# Python mein: uvicorn --reload  ya  flask run --debug
+# Node.js mein: nodemon index.js
+# Go mein: air  ← yahi hai
+
+[build]
+  # Kaunsa command run karna hai build ke liye
+  # Python: pip install -e .  jaisa
+  # Node.js: npm run build  jaisa
+  cmd = "go build -o ./tmp/server ./cmd/server/main.go"
+
+  # Build ke baad kaunsa binary run karna hai
+  bin = "./tmp/server"
+  entrypoint = "./tmp/server"
+
+  # Kaunse files watch karne hain (sirf .go files)
+  include_ext = ["go", "toml"]
+
+  # Kaunse folders IGNORE karne hain (unhe watch mat karo)
+  exclude_dir = ["tmp", "vendor", "testdata", "cmd/try-checker"]
+
+  # Agar build fail ho to bhi watch karta raho (next save pe try karega)
+  kill_delay = "200ms"
+  rerun_delay = 500
+
+[log]
+  # Colored output — Air ke messages green/red mein dikhenge
+  main_only = false
+
+[color]
+  main = "magenta"
+  build = "yellow"
+  runner = "green"
+
+[misc]
+  # tmp folder mein binary rakhta hai (gitignore mein add kar do)
+  clean_on_exit = true

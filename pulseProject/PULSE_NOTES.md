@@ -291,8 +291,319 @@ Ctrl+C  (sends SIGINT → graceful shutdown)
 
 ### What's next — Stage 2
 
-We'll bring the database to life:
-- `internal/platform/` — connect to PostgreSQL via GORM and Redis via go-redis
-- `internal/repository/` — `MonitorRepository` and `UserRepository` interfaces + GORM implementations
-- GORM auto-migrate to create the tables from our domain structs
-- Zerolog structured logger wired into `main.go`
+Stage 2 mein hum checker banayenge:
+- `internal/checker/` — Checker interface + HTTPChecker implementation
+- context timeout per HTTP check
+- defer resp.Body.Close() pattern
+
+---
+
+## Stage 2 — Checker (Interface + HTTP)
+
+### What we built
+
+| File | Purpose |
+|---|---|
+| `internal/checker/checker.go` | `Checker` interface + `Result` struct + helpers |
+| `internal/checker/http_checker.go` | `HTTPChecker` — real HTTP GET using `net/http` |
+| `cmd/try-checker/main.go` | Throwaway demo — probe real URLs and print results |
+
+---
+
+### The Three Files Ka Kaam
+
+```
+checker.go          → CONTRACT (interface) — kya karna hai
+http_checker.go     → IMPLEMENTATION — kaise karna hai
+try-checker/main.go → DEMO — dekhne ke liye ki kaam kar raha hai
+```
+
+Yeh separation important hai:
+- Worker pool (Stage 6) `checker.go` import karega — sirf interface chahiye
+- `http_checker.go` sirf `main.go` mein inject hoga (wiring layer)
+- Tests mein `fakeChecker` banayenge jo `checker.go` ka interface satisfy kare
+
+---
+
+### Concept 1 — Interface as Contract
+
+**Analogy:** Electric socket. Socket ka shape = interface. Jo bhi plug fit kare = implementation.
+Socket ko parwah nahi phone charger hai ya laptop charger — bas shape match honi chahiye.
+
+```go
+// checker.go — CONTRACT (socket ka shape)
+type Checker interface {
+    Check(ctx context.Context, url string) Result
+}
+
+// http_checker.go — IMPLEMENTATION (actual device)
+type HTTPChecker struct { client *http.Client }
+func (h *HTTPChecker) Check(ctx context.Context, url string) Result { ... }
+
+// test mein — FAKE IMPLEMENTATION (test device)
+type fakeChecker struct{ result Result }
+func (f fakeChecker) Check(_ context.Context, _ string) Result { return f.result }
+```
+
+**Go mein interface satisfy karne ka rule:**
+Koi bhi type interface satisfy karta hai agar uske paas woh sab methods hain.
+`implements` likhna nahi padta — Python/Java jaisa nahi.
+
+```
+Python:   class HTTPChecker(Checker): ...    # explicitly inherit karna padta hai
+Node.js:  class HTTPChecker implements Checker  # TypeScript mein explicitly likhna padta hai
+Go:       kuch nahi likhna — bas method honi chahiye — automatic ✅
+```
+
+**WHY interface?**
+
+```
+Production:  var c Checker = NewHTTPChecker(10s)  → real HTTP calls
+Tests:       var c Checker = fakeChecker{...}      → no network, instant, deterministic
+Worker pool: c.Check(ctx, url)                     → same code, different behavior
+```
+
+Bina interface ke tests mein real HTTP calls karni padti — flaky, slow, internet chahiye.
+
+---
+
+### Concept 2 — Result struct by value (not pointer)
+
+```go
+type Result struct {
+    StatusCode int
+    LatencyMs  int64
+    Up         bool
+    Err        error
+}
+
+// Returned BY VALUE — not *Result
+func (h *HTTPChecker) Check(...) Result { ... }
+```
+
+**WHY value, not pointer (`*Result`)?**
+
+```
+*Result (pointer) → heap pe allocate hota hai → GC ka kaam badha
+ Result (value)  → stack pe copy hota hai    → cheap (~40 bytes)
+
+Pointer ki zaroorat tab hoti hai jab:
+  - struct bahut bada ho (100+ bytes)
+  - nil return karna ho (failure ka signal)
+
+Result mein Err field hai — nil Result ki zaroorat nahi.
+Caller hamesha ek valid Result pata hai.
+```
+
+```
+Python:  return None ya return Result(...)  — None possible
+Node.js: return null ya return result       — null possible
+Go:      return Result{...}                 — hamesha valid struct, kabhi nil nahi
+```
+
+---
+
+### Concept 3 — `defer resp.Body.Close()`
+
+**Yeh line sabse important hai is file mein.**
+
+```go
+resp, err := h.client.Do(req)
+latency := time.Since(start)
+if err != nil {
+    return newErrorResult(latency, err)
+}
+defer resp.Body.Close()   // ← HAMESHA Do() ke baad, err check ke baad
+```
+
+**Kya hota hai agar bhool gaye?**
+
+```
+Check() → 1000 baar call hua
+  → 1000 TCP connections khulay
+  → 0 wapas pool mein gaye (body close nahi hui)
+  → OS ka file descriptor limit hit (Linux default: ~1024)
+  → "too many open files" → process crash ❌
+```
+
+**`defer` kya hai?**
+
+```go
+defer resp.Body.Close()
+// matlab: "jab bhi yeh function return kare — chahe koi bhi path se —
+//          yeh line zaroor chalana"
+```
+
+```
+Python:  with requests.get(url) as r:   → context manager auto-close karta hai
+         try: ... finally: r.close()    → explicit finally block
+
+Node.js: response.body.cancel()         → rarely done explicitly
+
+Go:      defer resp.Body.Close()        → ek line, guaranteed, har return path pe
+```
+
+**`defer` ka execution order:**
+
+```go
+func example() {
+    defer fmt.Println("3rd")   // last registered, first executed
+    defer fmt.Println("2nd")
+    defer fmt.Println("1st")   // first registered, last executed
+}
+// Output: 1st, 2nd, 3rd
+// LIFO order — Last In, First Out (stack jaisa)
+```
+
+---
+
+### Concept 4 — `http.NewRequestWithContext` vs `http.Get`
+
+```go
+// ❌ GALAT — context support nahi
+resp, err := http.Get(url)
+
+// ✅ SAHI — context se cancel/timeout ho sakta hai
+req, _ := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+resp, err := h.client.Do(req)
+```
+
+**Kyon farak padta hai?**
+
+```
+Worker pool mein 10 goroutines hain.
+Ek goroutine http.Get(url) call karta hai.
+URL 60 second tak respond nahi karta.
+http.Get cancel nahi ho sakta → goroutine 60s tak STUCK rahega.
+
+SIGTERM aaya → main.go context cancel kiya → kuch nahi hua
+Goroutine abhi bhi us URL ka wait kar raha hai.
+
+NewRequestWithContext ke saath:
+SIGTERM → context cancel → http transport turant TCP tod deta hai
+Goroutine free ho jaata hai → clean shutdown ✅
+```
+
+```
+Python:  requests.get() — mid-flight cancel nahi ho sakta easily
+         httpx.get() with asyncio.CancelledError → better
+Node.js: fetch(url, { signal: abortController.signal }) → same concept as context
+Go:      http.NewRequestWithContext(ctx, ...) → context cancellation built-in
+```
+
+---
+
+### Concept 5 — `Err` field ka matlab
+
+```go
+type Result struct {
+    ...
+    Err error   // nil = HTTP response mila; non-nil = koi response nahi mila
+}
+```
+
+**Do alag cases hain:**
+
+```
+result.Err != nil  →  Network failure — server tak pahuncha hi nahi
+                       e.g., DNS error, timeout, connection refused
+                       StatusCode = 0 (koi HTTP response nahi)
+
+result.Up == false →  Server reachable hai lekin unhealthy
+AND result.Err == nil   e.g., StatusCode = 503
+                        Server ne response diya, bas galat code diya
+```
+
+**Real example:**
+
+```
+https://example.com        → StatusCode=200, Up=true,  Err=nil   ✅ healthy
+https://example.com/broken → StatusCode=500, Up=false, Err=nil   ⚠️  reachable but broken
+https://no-server.xyz      → StatusCode=0,   Up=false, Err=...   ❌ unreachable
+```
+
+---
+
+### `io.Discard` — body drain karna
+
+```go
+defer resp.Body.Close()
+io.Copy(io.Discard, resp.Body)  // body padho aur phenk do
+```
+
+Sirf `Close()` karna kaafi nahi HTTP/1.1 mein:
+
+```
+Server ne 500KB ka response body bheja.
+Tum sirf status code chahte ho.
+Close() bina drain ke → TCP connection reuse nahi ho sakta
+                      → pool mein wapas nahi jaata
+                      → next request ke liye naya connection banana padega (slow)
+
+io.Discard = /dev/null jaisa — padho aur phenk do
+io.Copy(io.Discard, body) → poora body consume karo, connection pool mein wapas
+```
+
+---
+
+### Live Demo Output Explained
+
+```bash
+go run ./cmd/try-checker
+```
+
+```
+✅ UP   example.com          status=200  latency=310ms
+```
+200 aaya, `IsUp(200)` = true → server healthy.
+
+```
+❌ DOWN google.com           status=301  latency=278ms
+```
+301 redirect aaya. Humne `CheckRedirect: return http.ErrUseLastResponse` set kiya —
+redirect follow nahi kiya. 301 is not 2xx → `IsUp(301)` = false.
+
+```
+❌ DOWN httpstat.us/503      status=0    latency=3413ms | context deadline exceeded
+❌ DOWN ...delay/10000       status=0    latency=0ms    | context deadline exceeded
+❌ DOWN this.invalid         status=0    latency=0ms    | context deadline exceeded
+⚠️  Overall context ended: context deadline exceeded
+```
+4-second overall context expire ho gayi. Baaki URLs ko context already cancelled milaa —
+HTTP transport ne instantly error return kiya bina network call ke. `latency=0ms` proof hai
+ki wire pe kuch gaya hi nahi.
+
+**Yahi hai context cancellation ka power** — ek cancel signal poori chain mein propagate ho jaata hai.
+
+---
+
+### Go Gotchas in Stage 2
+
+| Gotcha | Explanation |
+|---|---|
+| `http.Get` has no context | Use `http.NewRequestWithContext` always — `http.Get` can't be cancelled |
+| `defer` runs at function return | Not at end of block — `defer` inside a `for` loop defers to function end, not iteration end |
+| Pointer receiver on struct with mutex | `http.Client` has internal mutex — copy karna bug hai. Always use `*HTTPChecker` |
+| Interface satisfied implicitly | Go mein `implements` nahi likhte — method signature match karna kaafi hai |
+| `io.Copy` before `Close` | Drain body before closing otherwise HTTP/1.1 connection reuse nahi hota |
+| `latency` measure timing | `time.Since(start)` `Do()` ke baad measure karo, `Close()` ke baad nahi |
+
+---
+
+### Self-check Questions
+
+1. `*HTTPChecker` `Checker` interface satisfy karta hai — Go yeh kaise decide karta hai? Kya koi `implements` keyword chahiye?
+
+2. `result.Err != nil` aur `result.Up == false` mein kya farak hai? Ek example do jahan `Err == nil` lekin `Up == false` ho.
+
+3. `defer resp.Body.Close()` agar `http.NewRequestWithContext` ke baad aur err check se PEHLE likho toh kya hoga?
+
+---
+
+### What's next — Stage 3
+
+Platform layer aur Repository:
+- `internal/platform/` — PostgreSQL (GORM) + Redis + Zerolog logger connect karna
+- `internal/repository/` — Monitor aur Check ke liye DB access interfaces + implementations
+- GORM auto-migrate — domain structs se tables banana
+- `main.go` mein logger wire karna

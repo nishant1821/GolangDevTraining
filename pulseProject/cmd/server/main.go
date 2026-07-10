@@ -5,8 +5,9 @@
 // It should contain as LITTLE logic as possible; it just assembles and starts.
 //
 // Think of it like:
-//   Python:  if __name__ == "__main__": uvicorn.run(app, host="0.0.0.0", port=8080)
-//   Node.js: app.listen(PORT, () => console.log(`Pulse running on ${PORT}`))
+//
+//	Python:  if __name__ == "__main__": uvicorn.run(app, host="0.0.0.0", port=8080)
+//	Node.js: app.listen(PORT, () => console.log(`Pulse running on ${PORT}`))
 package main
 
 import (
@@ -18,7 +19,7 @@ import (
 	"syscall"   // syscall.SIGTERM, syscall.SIGINT — OS signal constants
 	"time"      // time.Second — timeout durations
 
-	"github.com/go-chi/chi/v5"            // chi — lightweight HTTP router
+	"github.com/go-chi/chi/v5"                  // chi — lightweight HTTP router
 	chiMW "github.com/go-chi/chi/v5/middleware" // chi's built-in middleware
 
 	// Our own packages — note they are BELOW cmd/ in the dependency tree.
@@ -197,10 +198,11 @@ func main() {
 // healthHandler responds to GET /health with a simple JSON payload.
 //
 // Separating it from main() as a named function makes unit testing easy:
-//   w := httptest.NewRecorder()
-//   r := httptest.NewRequest(http.MethodGet, "/health", nil)
-//   healthHandler(w, r)
-//   assert.Equal(t, 200, w.Code)
+//
+//	w := httptest.NewRecorder()
+//	r := httptest.NewRequest(http.MethodGet, "/health", nil)
+//	healthHandler(w, r)
+//	assert.Equal(t, 200, w.Code)
 //
 // Python/FastAPI:   async def health() -> dict: return {"status": "ok"}
 // Node.js/Express:  app.get('/health', (req, res) => res.json({ status: 'ok' }))

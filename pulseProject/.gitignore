@@ -1,0 +1,8 @@
+# Air live-reload compiled binary
+tmp/
+
+# Environment variables — kabhi commit mat karo
+.env
+
+# OS files
+.DS_Store
