@@ -602,8 +602,603 @@ ki wire pe kuch gaya hi nahi.
 
 ### What's next — Stage 3
 
-Platform layer aur Repository:
-- `internal/platform/` — PostgreSQL (GORM) + Redis + Zerolog logger connect karna
-- `internal/repository/` — Monitor aur Check ke liye DB access interfaces + implementations
-- GORM auto-migrate — domain structs se tables banana
-- `main.go` mein logger wire karna
+Worker Pool:
+- `internal/monitor/pool.go` — bounded worker pool: goroutines, `sync.WaitGroup`, fan-out/fan-in
+- `internal/monitor/pool_test.go` — race-clean test: 20 jobs, 5 workers
+- Context cancellation guard — goroutine leak prevention
+
+---
+
+## Stage 3 — Worker Pool (Concurrency Core)
+
+### What we built
+
+| File | Purpose |
+|---|---|
+| `internal/monitor/pool.go` | `RunPool` — bounded worker pool, fan-out/fan-in, graceful shutdown |
+| `internal/monitor/pool_test.go` | `fakeChecker` + two tests: happy path (20 jobs / 5 workers) + cancel |
+
+---
+
+### The Big Picture — Pool ka Pulse mein kaam
+
+```
+DB mein 1000 monitors hain
+         │
+         ▼
+    Scheduler (Stage 4 mein banega)
+    "kaunse monitors ka check time aa gaya?"
+         │  Job{MonitorID:5, URL:"https://swiggy.com"} bhejta hai
+         ▼
+   [jobs channel]  ←── producer (scheduler)
+         │
+         ▼  FAN-OUT
+   Worker 0 → swiggy.com check
+   Worker 1 → zomato.com check      5 goroutines, ek saath
+   Worker 2 → razorpay.com check
+         │
+         ▼  FAN-IN
+   [out channel]  ──► Result Handler (Stage 5 mein banega)
+                       DB mein save, incident open/close, alert bhejo
+```
+
+**Pool ke bina:** 1000 monitors × 200ms = 200 seconds. Ek minute mein khatam nahi hoga.
+**Pool ke saath (10 workers):** 1000 ÷ 10 × 200ms = 20 seconds. ✅
+
+---
+
+### Concept 1 — Goroutine
+
+```go
+go func() {
+    // yeh code ek alag goroutine mein chalega
+}()
+```
+
+**Goroutine** = Go ka ultra-light thread.
+
+```
+OS Thread:    ~1 MB stack, OS manage karta hai, context switch expensive
+Goroutine:    ~2 KB stack, Go runtime manage karta hai, context switch cheap
+
+1000 OS threads = ~1 GB RAM + slow
+1000 goroutines = ~2 MB RAM + fast ✅
+```
+
+```
+Python:   asyncio.create_task(coro())  — event loop pe schedule karta hai
+Node.js:  JS single-threaded hai — I/O concurrency event loop se aata hai,
+          CPU work ke liye worker_threads
+Go:       go func(){}()               — real parallel execution (GOMAXPROCS CPUs)
+```
+
+**Key difference:** Python/Node ka concurrency cooperative hai (ek kaam manually yield karta hai). Go goroutines preemptive hain — runtime forcibly switch kar sakta hai. Real parallelism milta hai multi-core machines pe.
+
+---
+
+### Concept 2 — Channel (goroutines ke beech data bhejne ka rasta)
+
+```go
+jobs := make(chan Job, 100)   // buffered channel
+out  := make(chan Outcome, 5) // buffered channel
+
+// ek goroutine mein
+jobs <- Job{URL: "https://example.com"}   // SEND
+
+// doosri goroutine mein
+job := <-jobs                              // RECEIVE
+```
+
+**Channel rules:**
+```
+Unbuffered channel:  send BLOCK karta hai jab tak koi receive na kare (aur ulta)
+Buffered channel:    send BLOCK karta hai sirf jab buffer FULL ho
+
+Channel close karna: close(ch)
+  - Baad mein send → PANIC ❌
+  - Receive pe: value milegi (agar buffer mein kuch hai), phir zero value + ok=false
+  - range ch: automatically ruk jaata hai jab channel close ho
+```
+
+```
+Python:   asyncio.Queue()    — async get() / put()
+Node.js:  EventEmitter ya    — stream.write() / stream.on('data')
+          Readable streams
+Go:       channel            — built-in language feature, type-safe, goroutine-safe
+```
+
+**Sabse important rule:** Channel **sirf woh goroutine close kare** jo producer hai — jisne data daala. Multiple goroutines close karein toh PANIC.
+
+---
+
+### Concept 3 — `sync.WaitGroup` (N goroutines ka wait)
+
+```go
+var wg sync.WaitGroup
+
+wg.Add(5)        // counter = 5 (workers launch karne se PEHLE)
+
+for i := 0; i < 5; i++ {
+    go func() {
+        defer wg.Done()  // counter-- jab goroutine exit kare
+        // kaam karo
+    }()
+}
+
+wg.Wait()        // BLOCK karo jab tak counter 0 na ho
+```
+
+```
+Python:   asyncio.gather(*tasks)   — await karo sab tasks ka
+Node.js:  Promise.all(promises)    — resolve hoga jab sab settle ho
+Go:       sync.WaitGroup           — explicit manual counter, low-level
+```
+
+**`wg.Add(N)` goroutines launch karne se PEHLE kyun?**
+```
+Agar loop ke andar wg.Add(1) karo aur goroutine wg.Done() pehle call kar le
+toh counter negative ho sakta hai → PANIC.
+Safe pattern: ek baar wg.Add(totalWorkers) phir launch karo.
+```
+
+---
+
+### Concept 4 — Fan-out aur Fan-in
+
+```
+Fan-out: 1 channel → N readers
+         Har Job exactly EK worker ko milta hai (channel guarantee)
+         Restaurant mein: order board → 5 cooks mein se koi ek uthata hai
+
+Fan-in:  N writers → 1 channel
+         Sab workers ek hi `out` channel mein likhte hain
+         Caller ko ek clean merged stream milta hai
+         Restaurant mein: sab cooks serving counter pe plate rakhte hain
+```
+
+```go
+// FAN-OUT: ek jobs channel, N workers
+for i := 0; i < workers; i++ {
+    go func() {
+        for { select { case job := <-jobs: ... } }
+    }()
+}
+
+// FAN-IN: N workers, ek out channel
+case out <- Outcome{Job: job, Result: result}:
+```
+
+```
+Python:  asyncio mein:  asyncio.Queue() se multiple workers consume karte hain
+Node.js: Node streams:  readable.pipe() → multiple writable destinations
+Go:      channels:      built-in, type-safe fan-out/fan-in
+```
+
+---
+
+### Concept 5 — `ctx.Done()` guard — Goroutine Leak rokna
+
+**Goroutine leak kya hota hai:**
+
+```
+Worker jobs channel pe wait kar raha hai...
+No more jobs aayenge (scheduler band ho gaya)
+jobs channel close bhi nahi hua...
+ctx cancel bhi nahi hua...
+Worker HAMESHA ke liye memory mein phansa = GOROUTINE LEAK
+```
+
+**Leak ke 2 jagah pool mein:**
+
+```go
+// Jagah 1: job ka wait karte waqt
+select {
+case job, ok := <-jobs:   // kaam mila → karo
+    if !ok { return }     // channel closed → ghar jao
+case <-ctx.Done():        // ← YEH GUARD hai — ctx cancel → ghar jao
+    return
+}
+
+// Jagah 2: outcome send karte waqt
+select {
+case out <- Outcome{...}: // send successful → agle job pe jao
+case <-ctx.Done():        // ← YEH GUARD hai — consumer band ho gaya → ghar jao
+    return
+}
+```
+
+**`ctx.Done()` kya hai?**
+```go
+ctx.Done()  // ek channel hai jo CLOSE ho jaata hai jab ctx cancel hoti hai
+            // closed channel se receive karna immediately return karta hai
+            // isliye select mein yeh "signal" ki tarah kaam karta hai
+```
+
+```
+Python asyncio: task.cancel() → CancelledError raise hoti hai coroutine mein
+Node.js:        AbortSignal.aborted → true ho jaata hai, event fire hota hai
+Go:             ctx.Done() channel close hota hai → select case trigger hota hai
+```
+
+---
+
+### Concept 6 — Closer Goroutine (channel safely close karna)
+
+**Problem:** `close(out)` kab karein?
+
+```
+Option 1: RunPool mein wg.Wait() phir close(out)
+
+  RunPool → wg.Wait() pe BLOCK
+  Caller ko `out` nahi mila abhi tak
+  Caller read nahi kar sakta
+  Workers `out` pe BLOCK (full ya unbuffered)
+  wg.Done() nahi bolta
+  wg.Wait() kabhi return nahi karta
+  = DEADLOCK ❌
+```
+
+```
+Option 2: close(out) wg.Wait() se PEHLE
+
+  Workers abhi bhi `out` pe likh rahe hain
+  close() + write = PANIC ❌
+```
+
+```
+Option 3 (SAHI): alag goroutine mein wg.Wait() phir close(out)
+
+  RunPool `out` return kar deta hai (non-blocking)
+  Caller read karna shuru karta hai
+  Workers unblock ho ke likhte hain
+  wg.Done() sab call karte hain
+  Closer goroutine: wg.Wait() return karta hai → close(out) ✅
+  Caller ka `range out` naturally end hota hai ✅
+```
+
+```go
+go func() {
+    wg.Wait()   // sab workers done hone ka wait
+    close(out)  // ab safe hai close karna
+}()
+
+return out      // TURANT return — no blocking
+```
+
+```
+Python:  asyncio.gather() ke baad queue.join() implicitly handle hota hai
+Node.js: Promise.all(workers).then(() => stream.end())
+Go:      manually closer goroutine — explicit control, zero magic
+```
+
+---
+
+### Domain structs se connection
+
+```go
+// Domain Monitor → Job (scheduler banata hai)
+Job{
+    MonitorID: monitor.ID,              // domain.Monitor.ID
+    URL:       monitor.URL,             // domain.Monitor.URL
+}
+// monitor.IntervalSeconds → scheduler decide karta hai kab Job banana hai
+// monitor.TimeoutSeconds  → ctx ka timeout yahan se aayega
+// monitor.Active == false → Job banana hi mat
+
+// Outcome.Result → domain Check row (result handler save karega)
+Check{
+    MonitorID:      outcome.Job.MonitorID,      // domain.Check.MonitorID
+    StatusCode:     outcome.Result.StatusCode,  // domain.Check.StatusCode
+    ResponseTimeMs: outcome.Result.LatencyMs,   // domain.Check.ResponseTimeMs
+    Up:             outcome.Result.Up,          // domain.Check.Up
+    Error:          outcome.Result.Err.Error(), // domain.Check.Error
+}
+
+// Agar Up == false → domain Incident open hoga (Stage 5)
+// Agar Up == true aur pehle incident tha → Incident.ResolvedAt set hoga
+```
+
+---
+
+### Go Gotchas in Stage 3
+
+| Gotcha | Explanation |
+|---|---|
+| `close()` sirf producer kare | Multiple goroutines close karein → PANIC. Closer goroutine pattern isliye use karte hain. |
+| `wg.Add()` launch se pehle | Loop ke andar `wg.Add(1)` karo lekin goroutine pehle Done() bole → counter negative → PANIC |
+| `range jobs` bina `ctx.Done()` | Context cancel pe goroutine phansa rehta hai — goroutine leak |
+| `wg.Wait()` RunPool mein block karna | Deadlock — caller ko `out` milta nahi, workers block ho jaate hain |
+| `send on closed channel` | close() ke baad koi write kare → runtime panic. wg.Wait() guarantee karta hai sab done hain. |
+| Goroutine argument capture | Loop variable `i` goroutine mein directly use karo → data race. Hamesha argument pass karo ya closure ke andar fresh variable. |
+
+---
+
+### Self-check Questions
+
+1. **`close(out)` `wg.Wait()` se pehle kyun nahi kar sakte?** Kya hoga agar karo?
+
+2. **`for job := range jobs` kyun use nahi kiya? `select` mein kya extra milta hai?**
+
+3. **`wg.Add(workers)` loop ke andar karna (`wg.Add(1)` per goroutine) safe kyun nahi hoga yahan?**
+   Hint: `wg.Wait()` closer goroutine mein pehle se chal raha hai.
+
+4. **`out` channel ko `make(chan Outcome, workers)` buffered banaya — unbuffered hota toh kya change hota?**
+
+---
+
+### What's next — Stage 4
+
+Scheduler:
+- `internal/monitor/scheduler.go` — ticker goroutine jo DB query karke due monitors ke liye Jobs channel mein daalega
+- `internal/platform/` — PostgreSQL (GORM) + Zerolog logger connect karna
+- `internal/repository/` — Monitor DB access interface + implementation
+- `main.go` mein Scheduler + Pool wire karna
+
+---
+
+## Stage 4 — Scheduler (context + select + ticker)
+
+### What we built
+
+| File | Purpose |
+|---|---|
+| `internal/monitor/scheduler.go` | `Scheduler` — ticks on interval, enqueues Jobs, closes channel on ctx cancel |
+| `internal/monitor/scheduler_test.go` | Happy path (jobs enqueued) + cancel test (channel closes) |
+| `cmd/try-pool/main.go` | Runnable demo: Scheduler + RunPool wired together, live output |
+
+---
+
+### The Full Pipeline — ab dono pieces hain
+
+```
+cancel()
+   │
+   ▼
+context cancelled
+   │
+   ├──► Scheduler goroutine
+   │      ctx.Done() case fires
+   │      defer close(jobs) fires        ← Scheduler owns close(jobs)
+   │
+   ├──► Workers (pool.go)
+   │      case job, ok := <-jobs
+   │        ok=false → return            ← jobs closed signal
+   │      defer wg.Done() × N
+   │
+   └──► Closer goroutine (pool.go)
+          wg.Wait() returns (all workers done)
+          close(out) fires               ← safe: no writers left
+          caller's `range out` exits ✅
+```
+
+**Ek `cancel()` call → poori chain band. Koi goroutine leak nahi.**
+
+---
+
+### Concept 1 — `time.Ticker`
+
+```go
+ticker := time.NewTicker(200 * time.Millisecond)
+defer ticker.Stop()   // timer goroutine release karo
+
+for {
+    select {
+    case <-ticker.C:
+        // har 200ms yeh case fire hota hai
+    }
+}
+```
+
+`ticker.C` ek channel hai. Har `tick` duration ke baad current time iss channel mein aata hai.
+
+```
+Python:  asyncio.sleep(tick) loop mein — cooperative yield
+Node.js: setInterval(fn, tick) → clearInterval(id) cleanup mein
+Go:      time.NewTicker(tick) → ticker.C channel → defer ticker.Stop()
+```
+
+**`defer ticker.Stop()` kyun zaruri hai?**
+```
+NewTicker internally ek goroutine start karta hai jo channel mein time bhejta hai.
+Stop() nahi kiya → woh goroutine hamesha ke liye chal raha rahega.
+= Timer goroutine leak.
+```
+
+---
+
+### Concept 2 — `defer close(jobs)` — Producer ka Rule
+
+```go
+func Scheduler(...) <-chan Job {
+    jobs := make(chan Job, 100)
+
+    go func() {
+        defer close(jobs)   // ← yeh line sabse important hai
+        defer ticker.Stop()
+
+        for {
+            select {
+            case <-ticker.C: // jobs bhejo
+            case <-ctx.Done(): return  // close trigger hoga defer se
+            }
+        }
+    }()
+
+    return jobs
+}
+```
+
+**Sirf producer channel close kare — rule kyun?**
+
+```
+Agar RunPool workers bhi close(jobs) try karein:
+  Worker 1: close(jobs) → OK
+  Worker 2: close(jobs) → PANIC: close of closed channel ❌
+
+Scheduler ek hi goroutine hai jo jobs mein likhta hai.
+Isliye sirf Scheduler defer close(jobs) kare — guaranteed safe.
+```
+
+**`defer` vs explicit `close()` at function end:**
+```go
+// ❌ fragile — future mein koi `return` add kare aur close miss ho jaaye
+func() {
+    for { ... }
+    close(jobs)  // yeh line kabhi kabhi skip ho sakti hai
+}()
+
+// ✅ guaranteed — function kisi bhi path se return kare, close hoga
+func() {
+    defer close(jobs)
+    for { ... }
+}()
+```
+
+---
+
+### Concept 3 — Context Cancellation Propagation
+
+Context ek **family tree** hai. Parent cancel ho toh sab children cancel ho jaate hain.
+
+```go
+ctx, cancel := context.WithTimeout(context.Background(), 700*time.Millisecond)
+//              └── parent context (root)
+//                  700ms baad auto-cancel
+
+jobs := Scheduler(ctx, ...)
+//      Scheduler usi ctx ko use karta hai
+
+outcomes := RunPool(ctx, ...)
+//           RunPool usi ctx ko use karta hai
+```
+
+```
+context.Background()   ← root (kabhi cancel nahi hota)
+       │
+  ctx (700ms timeout)  ← cancel hoga 700ms baad ya explicit cancel() se
+       │
+  Scheduler uses ctx   ← ctx.Done() → scheduler stops
+  RunPool uses ctx     ← ctx.Done() → workers stop mid-send
+  HTTPChecker uses ctx ← ctx.Done() → TCP connection abort
+```
+
+**Python analogy:**
+```python
+# asyncio mein TaskGroup similar hai:
+async with asyncio.TaskGroup() as tg:
+    tg.create_task(scheduler())
+    tg.create_task(pool())
+# Ek task raise kare toh sab cancel ho jaate hain
+```
+
+**Node.js analogy:**
+```js
+const controller = new AbortController()
+setTimeout(() => controller.abort(), 700)
+// scheduler aur pool dono signal: controller.signal use karte hain
+// abort event fire ho → sab band
+```
+
+---
+
+### Concept 4 — `due func() []domain.Monitor` — Dependency Injection
+
+```go
+func Scheduler(ctx context.Context, tick time.Duration, due func() []domain.Monitor) <-chan Job
+```
+
+`due` ek **function parameter** hai — Scheduler ko parwah nahi kaise monitors milte hain.
+
+```
+Production mein:
+  due = func() []domain.Monitor {
+      monitors, _ := repo.FindDueMonitors(ctx)  // DB query
+      return monitors
+  }
+
+Tests mein:
+  due = func() []domain.Monitor {
+      return []domain.Monitor{{ID: 1, URL: "..."}}  // hardcoded
+  }
+```
+
+```
+Python: dependency_injector ya simple constructor parameter
+Node.js: constructor injection — new Scheduler(dueQuery)
+Go:      function as parameter — same concept, cleaner syntax
+```
+
+**Yahi pattern hai poore Pulse mein:**
+- Scheduler ko DB ka knowledge nahi chahiye
+- Pool ko Scheduler ka knowledge nahi chahiye
+- Sab pieces independently testable hain
+
+---
+
+### Teardown Trace — step by step
+
+`cancel()` call hone ke baad exactly kya hota hai:
+
+```
+T+0ms  cancel() called
+
+T+0ms  Scheduler goroutine:
+         select mein ctx.Done() case fire hota hai
+         return statement execute hota hai
+         defer ticker.Stop() → timer goroutine free
+         defer close(jobs) → jobs channel close hota hai
+
+T+0ms  Worker 0, 1, 2 (pool.go):
+         teeno kisi ek jagah pe hain:
+         (a) `case <-ticker.C` se naya job aane ka wait kar rahe hain
+             → `case <-ctx.Done()` fire hota hai → return
+         (b) jobs se job uthake chk.Check() chal raha hai
+             → ctx cancel → HTTPChecker TCP abort karta hai → return
+         (c) `case job, ok := <-jobs` try kar rahe hain
+             → jobs closed → ok=false → return
+
+T+0ms  Har worker: defer wg.Done() fire karta hai
+         wg counter: 3 → 2 → 1 → 0
+
+T+0ms  Closer goroutine (pool.go):
+         wg.Wait() return karta hai (counter = 0)
+         close(out) fire hota hai
+
+T+0ms  Caller (main.go / test):
+         `range outcomes` loop exit hota hai
+         Program cleanly khatam ✅
+```
+
+---
+
+### Go Gotchas in Stage 4
+
+| Gotcha | Explanation |
+|---|---|
+| `ticker.Stop()` bhool gaye | Internal timer goroutine hamesha ke liye chalta rahega — leak |
+| `defer close(jobs)` bhool gaye | jobs kabhi close nahi hogi → pool workers kabhi nahi niklenge → deadlock |
+| `due()` ko ctx pass nahi kiya | DB query timeout nahi hogi — slow query goroutine ko hang karegi |
+| Scheduler ko `jobs` close nahi karna | Agar Scheduler kabhi return na kare, close kabhi nahi hoga — pipeline hang |
+| `context.Background()` directly use karna | Root context cancel nahi hota — graceful shutdown impossible. Hamesha cancellable ctx use karo. |
+
+---
+
+### Self-check Questions
+
+1. **cancel() call hone ke baad poori sequence trace karo** — Scheduler se lekar `range outcomes` exit tak. Kitne goroutines hain aur kaunsa kab exit karta hai?
+
+2. **Scheduler `close(jobs)` karta hai, RunPool workers nahi — kyun?** Kya hoga agar ek worker bhi close karne ki koshish kare?
+
+3. **`defer close(jobs)` vs function ke end mein `close(jobs)` — kya farak hai practically?**
+
+4. **`due` function parameter kyun hai? Direct DB call kyun nahi kiya Scheduler mein?**
+
+---
+
+### What's next — Stage 5
+
+Result Handler aur Repository:
+- `internal/repository/` — Monitor aur Check ke liye DB access (GORM)
+- `internal/monitor/handler.go` — outcomes channel drain karta hai, Check DB mein save karta hai, Incident open/close karta hai
+- `internal/platform/` — PostgreSQL connection bootstrap
+- `main.go` mein poora pipeline wire karna: Scheduler + Pool + Handler
