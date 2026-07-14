@@ -40,8 +40,9 @@ import (
 // Node.js: plain object          — { monitorId: 5, url: "https://…" }
 // Go:      value struct          — copied into the channel's internal buffer
 type Job struct {
-	MonitorID uint   // PK of the monitors row — persisted with the result
-	URL       string // the endpoint to probe, e.g. "https://api.example.com/ping"
+	MonitorID       uint   // PK of the monitors row — persisted with the result
+	URL             string // the endpoint to probe, e.g. "https://api.example.com/ping"
+	IntervalSeconds int    // check interval — service uses this to set NextCheckAt after recording
 }
 
 // Outcome is produced by a worker and consumed by the caller of RunPool.

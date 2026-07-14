@@ -92,6 +92,19 @@ type MonitorRepository interface {
 	//
 	// SQL: UPDATE monitors SET deleted_at=NOW() WHERE id=$1
 	Delete(ctx context.Context, id uint) error
+
+	// SetStatus updates the monitor's human-readable status field:
+	// "unknown" → initial state; "up" → last probe passed; "down" → last probe failed.
+	//
+	// Unlike UpdateStatus (which controls the scheduler's active bool),
+	// SetStatus tracks the last known probe outcome and is changed
+	// atomically with Incident creation/resolution (Stage 9 transactions).
+	//
+	// Uses txDB(ctx, r.db) internally so it participates in RunInTx transactions
+	// transparently — pass a transactional context and it uses the tx handle.
+	//
+	// SQL: UPDATE monitors SET status=$1, updated_at=NOW() WHERE id=$2
+	SetStatus(ctx context.Context, id uint, status string) error
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -250,6 +263,36 @@ func (r *gormMonitorRepo) Delete(ctx context.Context, id uint) error {
 	}
 	if result.RowsAffected == 0 {
 		return fmt.Errorf("delete monitor %d: %w", id, domain.ErrNotFound)
+	}
+	return nil
+}
+
+// SetStatus updates the monitor's status field ("unknown", "up", "down").
+//
+// TRANSACTION AWARENESS — uses txDB(ctx, r.db) instead of r.db directly:
+//   When called from inside repository.Transactor.RunInTx, ctx carries
+//   a *gorm.DB transaction handle. txDB() extracts it so this UPDATE
+//   runs inside the same transaction as other calls in the same RunInTx block.
+//   When called outside a transaction, txDB() falls back to r.db.
+//
+// WHY map[string]any instead of Updates(struct)?
+//   GORM skips zero-value fields when updating with a struct.
+//   An empty string "" is the zero value for string — it would be skipped.
+//   Even if we never set status to "", using map[string]any is explicit and safe.
+//
+// Python: session.query(Monitor).filter_by(id=id).update({"status": status})
+// Node.js: await Monitor.update({ status }, { where: { id } })
+func (r *gormMonitorRepo) SetStatus(ctx context.Context, id uint, status string) error {
+	db := txDB(ctx, r.db) // use transaction DB if inside RunInTx, else regular DB
+	result := db.WithContext(ctx).
+		Model(&domain.Monitor{}).
+		Where("id = ?", id).
+		Updates(map[string]any{"status": status})
+	if result.Error != nil {
+		return fmt.Errorf("set monitor %d status %q: %w", id, status, translateError(result.Error))
+	}
+	if result.RowsAffected == 0 {
+		return fmt.Errorf("set monitor %d status: %w", id, domain.ErrNotFound)
 	}
 	return nil
 }

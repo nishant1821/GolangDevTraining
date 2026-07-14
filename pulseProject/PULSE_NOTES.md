@@ -1506,3 +1506,2080 @@ Result Handler + Service layer:
 - `internal/monitor/result_handler.go` — `outcomes` channel drain karna, Check save karna, Incident open/close karna
 - `internal/service/` — business logic layer (MonitorService)
 - Full pipeline wire in `main.go`: Scheduler + Pool + ResultHandler sab ek saath
+
+---
+
+## Stage 6 — Service Layer + Pipeline Wiring
+
+### What we built
+
+| File | Purpose |
+|---|---|
+| `internal/service/monitor_service.go` | Business logic: RecordOutcome, CreateMonitor, GetMonitor, ListMonitors, PauseMonitor, ResumeMonitor, DeleteMonitor |
+| `internal/monitor/pool.go` (updated) | `IntervalSeconds` field added to `Job` struct |
+| `internal/monitor/scheduler.go` (updated) | `IntervalSeconds` passed in Job construction |
+| `cmd/server/main.go` (rewritten) | Full wiring: config → db → repos → service → checker → scheduler → pool → outcome goroutine → HTTP server |
+
+---
+
+### The Complete Pipeline — Ab Poora Kaam Karta Hai
+
+```
+main.go
+  │
+  ├── config.Load()                      ← env vars
+  ├── database.Connect() + AutoMigrate() ← Postgres
+  ├── repository.New*()                  ← DB access interfaces
+  ├── service.NewMonitorService()        ← business logic
+  ├── checker.NewHTTPChecker()           ← HTTP probe tool
+  │
+  ├── monitor.Scheduler()  ──► [jobs chan]
+  │      ↓ har tick pe
+  │      monitorRepo.ListDue() → due monitors
+  │      har monitor → Job{ID, URL, IntervalSeconds}
+  │
+  ├── monitor.RunPool()    ──► [outcomes chan]
+  │      ↓ har job pe
+  │      httpChecker.Check(ctx, url) → Result
+  │
+  ├── go func() { for o := range outcomes }
+  │      ↓ har outcome pe
+  │      svc.RecordOutcome(ctx, o)
+  │        ├── checks.Save()               ← DB mein log
+  │        ├── monitors.UpdateNextCheck()  ← agla check schedule
+  │        └── incidents: open/close       ← alerting logic
+  │
+  └── http.Server  ← Stage 7 mein handlers aayenge
+```
+
+---
+
+### Concept 1 — Dependency Injection By Hand
+
+**Go mein koi DI framework nahi** (no Spring, no FastAPI Depends, no NestJS).
+Sab kuch manually `main.go` mein wire karte hain.
+
+```go
+// ── INNERMOST LAYER PEHLE ──
+db := database.Connect(cfg.DatabaseURL)      // needs: config
+
+// ── LAYER 2: Repositories ──
+monitorRepo := repository.NewMonitorRepository(db)   // needs: *gorm.DB
+checkRepo   := repository.NewCheckRepository(db)
+incidentRepo:= repository.NewIncidentRepository(db)
+
+// ── LAYER 3: Service ──
+svc := service.NewMonitorService(            // needs: repository interfaces
+    monitorRepo,
+    checkRepo,
+    incidentRepo,
+)
+
+// ── LAYER 4: Pipeline ──
+jobs     := monitor.Scheduler(ctx, tick, due)         // needs: ctx, due func
+outcomes := monitor.RunPool(ctx, httpChecker, 10, jobs) // needs: ctx, checker, jobs
+```
+
+**Rule:** "Jis cheez ko doosri cheez chahiye, woh pehle banao."
+
+```
+Python: 
+  repos = create_repos(db)
+  svc   = MonitorService(repos)  ← manually inject
+
+Node.js:
+  const repos = createRepos(db)
+  const svc   = new MonitorService(repos)  ← manually inject
+
+Go:
+  same — explicit, no magic ✅
+```
+
+---
+
+### Concept 2 — Service Layer Kya Hai / Kyun Chahiye?
+
+```
+Handler    ← "HTTP request aaya, kya karna hai?"
+  ↓
+Service    ← "Business rule kya hai?"       ← YEH STAGE 6
+  ↓
+Repository ← "DB mein kaise store karein?"
+  ↓
+Domain     ← "Data kaisa dikhta hai?"
+```
+
+**Service ke 3 rules:**
+1. **No HTTP** — `http.Request`, `http.ResponseWriter`, status codes — kuch nahi
+2. **No SQL** — `*gorm.DB`, SQL strings — kuch nahi
+3. **Only domain language** — `domain.Monitor`, `domain.ErrNotFound`, `domain.ErrValidation`
+
+**Kyun?**
+
+```
+Agar service HTTP jaane:
+  Service test karne ke liye HTTP server chalana padega
+  Ek line change karo → poora integration test fail
+
+Agar service SQL jaane:
+  Service test karne ke liye Postgres chahiye
+  CI mein pain
+
+Service SIRF interfaces jaane:
+  Test mein: fakeMonitorRepo inject karo → no DB, no HTTP, instant ✅
+```
+
+---
+
+### Concept 3 — `RecordOutcome` — Business Logic Ka Dil
+
+Yeh method wo hai jo Outcome lete hai (pool se) aur sab kuch karta hai:
+
+```go
+func (s *monitorService) RecordOutcome(ctx, o monitor.Outcome) error {
+    // Step 1: Check log mein save karo
+    c := &domain.Check{
+        MonitorID:      o.Job.MonitorID,
+        StatusCode:     o.Result.StatusCode,
+        ResponseTimeMs: o.Result.LatencyMs,
+        Up:             o.Result.Up,
+        Error:          o.Result.Err.Error(), // agar error ho
+    }
+    s.checks.Save(ctx, c)
+
+    // Step 2: Agla check kab? = Now + IntervalSeconds
+    next := time.Now().Add(time.Duration(o.Job.IntervalSeconds) * time.Second)
+    s.monitors.UpdateNextCheck(ctx, o.Job.MonitorID, next)
+
+    // Step 3: Incident logic
+    if !o.Result.Up {
+        // Site DOWN hai
+        _, err := s.incidents.OpenByMonitor(ctx, id)
+        if ErrNotFound → // Pehli baar down → Incident kholo
+        if nil         → // Already open incident hai → kuch mat karo
+    } else {
+        // Site UP hai
+        incident, err := s.incidents.OpenByMonitor(ctx, id)
+        if nil         → // Open incident tha → Resolve karo ✅
+        if ErrNotFound → // Pehle se UP tha → kuch mat karo
+    }
+}
+```
+
+**Business rules yahan hain — repository mein nahi:**
+- "Ek monitor ke liye ek hi open incident hoga"
+- "Pehli baar down hone pe hi incident bano"
+- "Wapas up aane pe incident resolve ho"
+
+---
+
+### Concept 4 — Service Handler Ko Import Kyun Nahi Kar Sakta?
+
+```
+handler imports service  ← OK ✅
+service imports handler  ← CIRCULAR IMPORT ❌
+```
+
+```
+handler → service → repository → domain
+   ↑___________________________________↑
+   Agar service handler import kare → yeh arrow circle ban jaata hai
+   Go compiler immediately error deta hai:
+   "import cycle not allowed"
+```
+
+**Practical example:**
+```go
+// handler/monitor_handler.go
+import "service"  // OK
+
+// service/monitor_service.go
+import "handler"  // ❌ COMPILE ERROR: import cycle
+```
+
+**Isliye arrows sirf EK TARAF jaate hain:**
+```
+main.go → handler → service → repository → domain
+                              checker ──┘
+```
+
+---
+
+### Concept 5 — Pipeline ka Alag Context Kyun?
+
+```go
+pipelineCtx, pipelineCancel := context.WithCancel(context.Background())
+// ... HTTP server ...
+shutCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+```
+
+**Do alag contexts — kyun?**
+
+```
+Scenario 1: Ek hi context (GALAT)
+
+  SIGTERM aaya
+  context cancel → pipeline band AND HTTP server band ek saath
+  HTTP requests jo chal rahi thi → force close ❌
+  Probe jo chal rahi thi → force abort ❌
+  DB writes incomplete ❌
+
+Scenario 2: Alag contexts (SAHI)
+
+  SIGTERM aaya
+  Step 1: pipelineCancel()
+            → Scheduler rukta hai
+            → Workers outcomes bhejte hain
+            → RecordOutcome sab DB writes complete karta hai
+            → Pipeline cleanly band ✅
+
+  Step 2: srv.Shutdown(10s deadline)
+            → HTTP server naye connections accept karna band
+            → In-flight HTTP requests 10s mein complete hote hain ✅
+```
+
+---
+
+### Shutdown Sequence — Poori Chain
+
+```
+Ctrl+C / SIGTERM
+  │
+  ▼
+pipelineCancel() called
+  │
+  ├─► Scheduler: ctx.Done() → return → defer close(jobs)
+  │
+  ├─► Workers (x10): jobs closed → ok=false → return → wg.Done()
+  │
+  ├─► Closer goroutine: wg.Wait() → close(outcomes)
+  │
+  ├─► Outcome goroutine: range outcomes exits → goroutine ends
+  │
+  ▼
+srv.Shutdown(10s)
+  │
+  ├─► No new HTTP connections
+  ├─► In-flight requests finish
+  │
+  ▼
+main() returns → os.Exit(0)
+
+Total: ~0-2 seconds for pipeline + up to 10s for HTTP = clean shutdown ✅
+```
+
+---
+
+### Go Gotchas in Stage 6
+
+| Gotcha | Explanation |
+|---|---|
+| Service imports handler | Circular import — Go compiler rejects it. Arrows go ONE way only. |
+| Service uses `*gorm.DB` | Now you can't test without Postgres. Always use repo interface. |
+| Shared context for pipeline + HTTP | Both cancel together — in-flight requests and DB writes fail. Use separate contexts. |
+| `UpdateNextCheck` error returned | If fatal, incident logic would be skipped. Log and continue — check was already saved. |
+| Ownership check missing | Any user could read/modify any monitor. Always check `m.UserID == userID`. |
+| `interval <= 0` default | If IntervalSeconds is 0 (new monitor bug), scheduler would spam checks. Defend with a minimum. |
+
+---
+
+### Self-check Questions
+
+1. **"Dependency Injection by hand" ka matlab kya hai Go mein?** Framework se kya farak hai?
+
+2. **Service handler import kyun nahi kar sakta?** Go mein error kya aayega?
+
+3. **`RecordOutcome` mein `UpdateNextCheck` fail ho → kya return karo?** Kyun?
+
+4. **Pipeline ka alag context kyun banaya? Agar shared hota toh kya problem hoti?**
+
+5. **Ownership check service mein kyun hai — repository mein kyun nahi?**
+
+---
+
+### What's next — Stage 7
+
+HTTP Handlers + Auth (JWT):
+- `internal/handler/monitor_handler.go` — REST endpoints: POST /monitors, GET /monitors, PATCH /monitors/:id/pause
+- `internal/middleware/auth.go` — JWT verification middleware
+- `bcrypt` password hashing in UserService
+- Full auth flow: register → login → JWT → protected routes
+
+---
+
+## Stage 7 — HTTP Handlers + JWT Auth
+
+### Kya banaya (Files)
+
+| File | Kya karta hai |
+|---|---|
+| `internal/service/user_service.go` | Register (bcrypt hash) + Login (bcrypt verify + JWT sign) |
+| `internal/service/monitor_service.go` | `MonitorService` interface added — handler is decoupled |
+| `internal/service/user_service.go` | `UserService` interface added — same reason |
+| `internal/middleware/auth.go` | Bearer token extract → JWT validate → UserID inject in context |
+| `internal/handler/respond.go` | Shared JSON writer + domain-error → HTTP status mapper |
+| `internal/handler/auth_handler.go` | POST /auth/register + POST /auth/login |
+| `internal/handler/monitor_handler.go` | POST/GET/DELETE /monitors + PATCH pause/resume |
+| `cmd/server/main.go` | Wired userRepo, userSvc, authH, monitorH, protected route group |
+
+---
+
+### Auth Flow — Poora picture
+
+```
+Client                        Server
+  │                              │
+  │  POST /auth/register         │
+  │  {"email":"…","password":"…"}│
+  │─────────────────────────────►│  AuthHandler.Register()
+  │                              │    → UserService.Register()
+  │                              │        → bcrypt.GenerateFromPassword(pw, 12)
+  │                              │        → userRepo.Create(user)
+  │◄─────────────────────────────│  201 {"id":1,"email":"…"}
+  │                              │
+  │  POST /auth/login            │
+  │  {"email":"…","password":"…"}│
+  │─────────────────────────────►│  AuthHandler.Login()
+  │                              │    → UserService.Login()
+  │                              │        → userRepo.ByEmail(email)
+  │                              │        → bcrypt.CompareHashAndPassword()
+  │                              │        → jwt.NewWithClaims(HS256, {UserID:1, exp:+24h})
+  │                              │        → token.SignedString(secret)
+  │◄─────────────────────────────│  200 {"token":"eyJhbGci…"}
+  │                              │
+  │  GET /monitors               │
+  │  Authorization: Bearer eyJ…  │
+  │─────────────────────────────►│  middleware.Auth()
+  │                              │    → jwt.ParseWithClaims(token, secret)
+  │                              │    → context.WithValue(ctx, userIDKey, 1)
+  │                              │  MonitorHandler.List()
+  │                              │    → middleware.UserIDFromCtx(ctx) == 1
+  │                              │    → svc.ListMonitors(ctx, 1, page, size)
+  │◄─────────────────────────────│  200 [{…},{…}]
+```
+
+---
+
+### Concept 1 — bcrypt kya hota hai?
+
+**Password ko kabhi bhi plain text store nahi karte.** Agar DB leak ho jaye, sab passwords exposed ho jaayenge.
+
+bcrypt ek **one-way hash function** hai:
+- Plain text `"mypassword"` → `"$2a$12$abc...xyz"` (60 char hash)
+- Hash se original password **kabhi recover nahi ho sakta** — yahi point hai
+- Login ke time `bcrypt.CompareHashAndPassword(storedHash, givenPassword)` — dono compare karta hai internally same process run karke
+
+```go
+// Register ke time:
+hashed, _ := bcrypt.GenerateFromPassword([]byte("mypassword"), 12)
+// DB mein store: "$2a$12$..."
+
+// Login ke time:
+err := bcrypt.CompareHashAndPassword([]byte(storedHash), []byte("mypassword"))
+// err == nil → password sahi hai
+// err != nil → galat password
+```
+
+**Python analogy:** `bcrypt.hashpw(password.encode(), bcrypt.gensalt(rounds=12))`
+**Node.js analogy:** `await bcrypt.hash(password, 12)` + `await bcrypt.compare(password, hash)`
+
+**Cost factor 12 kyun?**
+- Cost 4 = bahut fast = brute force easy
+- Cost 12 = ~250ms per hash = brute force bahut slow
+- Cost 15+ = login sluggish ho jaata hai
+- 12 industry standard hai web apps ke liye
+
+---
+
+### Concept 2 — JWT kya hota hai?
+
+JWT = **JSON Web Token** — ek signed string jo identity prove karta hai.
+
+Format: `header.payload.signature` (teen parts, dot se separated, base64url encoded)
+
+```
+eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9   ← header (algo: HS256)
+.
+eyJ1c2VyX2lkIjoxLCJleHAiOjE3...        ← payload (UserID: 1, exp: ...)
+.
+abcdef123456...                          ← signature (HMAC-SHA256 of header+payload)
+```
+
+**Kaise kaam karta hai:**
+1. Server `jwt.NewWithClaims(HS256, {UserID: 1, exp: now+24h})` create karta hai
+2. `.SignedString(secret)` se sign karta hai
+3. Client ko bhejta hai
+4. Client har request mein `Authorization: Bearer <token>` bhejta hai
+5. Server signature verify karta hai — agar kisi ne payload tamper kiya to signature mismatch hogi
+
+**Secret key kabhi client ko nahi milta** — server ke paas hai sirf.
+
+```go
+// Sign karna:
+claims := PulseClaims{
+    UserID: u.ID,
+    RegisteredClaims: jwt.RegisteredClaims{
+        ExpiresAt: jwt.NewNumericDate(time.Now().Add(24*time.Hour)),
+    },
+}
+token := jwt.NewWithClaims(jwt.SigningMethodHS256, claims)
+tokenStr, _ := token.SignedString(jwtSecret)
+
+// Verify karna (middleware mein):
+claims := &PulseClaims{}
+token, err := jwt.ParseWithClaims(tokenStr, claims, func(t *jwt.Token) (any, error) {
+    return jwtSecret, nil
+})
+// claims.UserID → 1 (agar valid)
+```
+
+**Python analogy:** `jwt.encode({"user_id": 1, "exp": ...}, secret, algorithm="HS256")`
+**Node.js analogy:** `jwt.sign({ userId: 1 }, secret, { expiresIn: "24h" })`
+
+---
+
+### Concept 3 — context.WithValue se UserID pass karna
+
+Middleware aur handler ek hi HTTP request lifecycle mein hote hain, lekin **alag functions** hain. Data share karne ka tarika hai Go `context`.
+
+```go
+// Middleware mein (auth.go):
+ctx := context.WithValue(r.Context(), userIDKey, claims.UserID)
+next.ServeHTTP(w, r.WithContext(ctx))
+
+// Handler mein (monitor_handler.go):
+userID, ok := middleware.UserIDFromCtx(r.Context())
+// userID == claims.UserID — wahi value jo middleware ne set ki thi
+```
+
+**Kyun custom type as key?**
+```go
+type ctxKey string
+const userIDKey ctxKey = "userID"
+```
+Agar plain string use karo — `context.WithValue(ctx, "userID", 1)` — to koi bhi package same key use kar sakta hai aur overwrite kar sakta hai. Custom type **compile-time unique** hoti hai — collision impossible.
+
+**Python analogy:** `request.state.user_id = 1` (FastAPI)
+**Node.js analogy:** `req.userId = 1` (Express middleware)
+
+---
+
+### Concept 4 — Service Interface kyun banaya?
+
+Stage 6 mein `NewMonitorService` return karta tha `*monitorService` (unexported concrete type). Handler package is type ko reference nahi kar sakta tha (lowercase = unexported).
+
+**Solution:** Service package mein hi interface define karo:
+
+```go
+// service/monitor_service.go
+type MonitorService interface {
+    CreateMonitor(ctx context.Context, ...) (*domain.Monitor, error)
+    GetMonitor(ctx context.Context, id, userID uint) (*domain.Monitor, error)
+    // ...
+}
+
+func NewMonitorService(...) MonitorService { // returns interface, not *monitorService
+    return &monitorService{...}
+}
+```
+
+**Handler:**
+```go
+type MonitorHandler struct {
+    svc service.MonitorService  // interface — not *monitorService
+}
+```
+
+**Fayde:**
+1. Handler test mein fake MonitorService inject kar sakte ho — real DB ki zarurat nahi
+2. Handler ka concrete struct se koi direct dependency nahi
+3. Circular import impossible — handler → service (interface), service → repository
+
+**Python analogy:** `class MonitorServiceProtocol(Protocol): ...` (typing.Protocol)
+**Node.js/TypeScript:** `interface MonitorService { createMonitor(...): Promise<Monitor> }`
+
+---
+
+### Concept 5 — "none algorithm" attack aur signing method check
+
+JWT mein ek purani vulnerability thi — attacker `alg: "none"` header set karta tha aur bina signature ke token bhejta tha. Naïve libraries is token ko valid maan leti thein.
+
+**Fix — middleware mein signing method check:**
+```go
+jwt.ParseWithClaims(tokenStr, claims, func(t *jwt.Token) (any, error) {
+    // Ye check zaruri hai:
+    if _, ok := t.Method.(*jwt.SigningMethodHMAC); !ok {
+        return nil, errors.New("unexpected signing method")
+    }
+    return jwtSecret, nil
+})
+```
+
+Agar koi `alg: "none"` bheje → type assertion fail → error → 401.
+
+---
+
+### Concept 6 — Domain error → HTTP status mapping
+
+Ek jagah mapping honi chahiye — **respond.go ka `Err()` function**.
+
+```go
+func Err(w http.ResponseWriter, err error) {
+    code := http.StatusInternalServerError
+    switch {
+    case errors.Is(err, domain.ErrNotFound):     code = 404
+    case errors.Is(err, domain.ErrValidation):   code = 422
+    case errors.Is(err, domain.ErrConflict):     code = 409
+    case errors.Is(err, domain.ErrUnauthorized): code = 401
+    }
+    // ...
+}
+```
+
+**Kyun ek jagah?**
+- Agar har handler mein alag status code likho → inconsistency aayegi
+- Service `domain.ErrNotFound` return karti hai — handler ko pata nahi hona chahiye woh 404 hai; `Err()` jaanta hai
+
+**Note:** Internal 500 errors mein original message nahi bhejte client ko:
+```go
+if code == http.StatusInternalServerError {
+    msg = "internal server error"  // SQL error user ko mat dikhao
+}
+```
+
+---
+
+### Route Structure — Chi router groups
+
+```go
+r := chi.NewRouter()
+r.Use(chiMW.Logger)      // global: sab requests log hote hain
+r.Use(chiMW.Recoverer)   // global: panic → 500 instead of crash
+
+// Public routes — no JWT
+r.Get("/health", healthHandler)
+r.Post("/auth/register", authH.Register)
+r.Post("/auth/login", authH.Login)
+
+// Protected routes — JWT required
+r.Route("/monitors", func(r chi.Router) {
+    r.Use(middleware.Auth([]byte(cfg.JWTSecret)))  // sirf /monitors/* ke liye
+    r.Post("/", monitorH.Create)
+    r.Get("/", monitorH.List)
+    r.Get("/{id}", monitorH.Get)
+    r.Patch("/{id}/pause", monitorH.Pause)
+    r.Patch("/{id}/resume", monitorH.Resume)
+    r.Delete("/{id}", monitorH.Delete)
+})
+```
+
+`r.Route` ek sub-router banata hai. `r.Use` us sub-router ke andar sirf wahan apply hota hai — `/health` pe `Auth` middleware nahi chalega.
+
+**Python/FastAPI analogy:**
+```python
+monitors_router = APIRouter(prefix="/monitors", dependencies=[Depends(get_current_user)])
+app.include_router(monitors_router)
+```
+
+**Node.js/Express analogy:**
+```javascript
+const monitorRouter = express.Router()
+monitorRouter.use(authMiddleware)
+app.use("/monitors", monitorRouter)
+```
+
+---
+
+### Gotchas
+
+| Gotcha | Solution |
+|---|---|
+| `json:"-"` on Password miss ho jaye | Password JSON mein leak ho jaayega — **security bug** |
+| Email enumeration | Login mein `domain.ErrUnauthorized` return karo — "user not found" mat batao |
+| bcrypt cost bahut low | Cost 4-6 = brute force fast hoga. Cost 12 minimum rakho. |
+| `alg: "none"` attack | `jwt.ParseWithClaims` ke key function mein signing method type-assert karo |
+| Context key collision | Plain string ki jagah custom `type ctxKey string` use karo |
+| `monitors == nil` in list | `nil` slice JSON mein `null` ban jaata hai — `[]domain.Monitor{}` se empty array bhejo |
+| 500 error details leak | Internal errors (`gorm:...`) client ko mat dikhao — generic "internal server error" bhejo |
+
+---
+
+### Self-check Questions
+
+1. **bcrypt ka "cost factor" kya control karta hai?** Production mein 12 kyun rakha?
+
+2. **JWT ka header, payload, signature kya hai?** Agar payload tamper kiya to kya hoga?
+
+3. **`context.WithValue` mein custom type key kyun use ki?** String key se kya problem aati?
+
+4. **`MonitorService` interface service package mein kyun define ki — handler package mein kyun nahi?**
+
+5. **`middleware.Auth` ne context mein UserID store kiya — ab handler kaise nikale?** Agar Auth middleware chain mein nahi hota to kya hota?
+
+6. **`Err(w, err)` internal error ka original message kyun nahi bhejta client ko?**
+
+7. **Email enumeration attack kya hai? Iska kya practical impact hai?**
+
+---
+
+### What's next — Stage 8
+
+- Handler unit tests (`httptest.NewRecorder`, mock service)
+- Incident list endpoint: `GET /api/monitors/{id}/incidents`
+- Rate limiting middleware (chi-ratelimit)
+
+---
+
+## Stage 7 (Revised) — RequestID + zerolog + Validator + Consistent Envelope
+
+### Kya banaya (nayi cheezein)
+
+| File | Kya karta hai |
+|---|---|
+| `internal/middleware/request_id.go` | UUID generate → context + `X-Request-ID` header |
+| `internal/middleware/logger.go` | zerolog structured request log (method, path, status, latency, request_id) |
+| `internal/handler/respond.go` | Consistent envelope `{success, data/error, message, request_id}` |
+| `internal/handler/monitor_handler.go` | go-playground/validator on create body; `GET /api/monitors/{id}/checks` paginated |
+| `internal/repository/check_repo.go` | `History` signature: added `offset int` for real pagination |
+| `internal/service/monitor_service.go` | `GetCheckHistory` added to interface + implementation |
+| `cmd/server/main.go` | zerolog init; `RequestID → Logger → Recoverer` middleware order; `/api` prefix |
+
+---
+
+### Concept 1 — Middleware Chain: Andar aur Bahar ka order
+
+Middleware ek **stack** ki tarah kaam karta hai — LIFO (Last In, First Out).
+
+```
+r.Use(middleware.RequestID)        ← 1st registered
+r.Use(middleware.NewLogger(log))   ← 2nd registered
+r.Use(chiMW.Recoverer)             ← 3rd registered
+```
+
+**Request aane par (IN — outermost se innermost):**
+```
+Request → RequestID → Logger → Recoverer → Handler
+```
+
+**Response jaane par (OUT — innermost se outermost):**
+```
+Handler → Recoverer → Logger (yahan status capture hota hai) → RequestID
+```
+
+Socho ek onion (pyaaz):
+- Har `r.Use()` ek layer add karta hai
+- Request center ki taraf jaati hai (sab layers se guzarti hai)
+- Response wapas center se bahaar aati hai (wahi layers ulte order mein)
+
+**WHY RequestID pehle hona chahiye?**
+Logger `RequestIDFromCtx()` call karta hai. Agar RequestID baad mein hota, context mein UUID nahi hota — log mein `request_id: ""` dikha.
+
+```
+WRONG order:
+  Logger → RequestID → Handler
+  Logger: RequestIDFromCtx(ctx) == ""  ← UUID abhi context mein nahi!
+
+CORRECT order:
+  RequestID → Logger → Handler
+  Logger: RequestIDFromCtx(ctx) == "abc-123"  ← UUID already set hai
+```
+
+**Python/FastAPI analogy:**
+```python
+# FastAPI mein LAST add = FIRST run (ulta order)
+app.add_middleware(LoggingMiddleware)   ← second run
+app.add_middleware(RequestIDMiddleware) ← first run  (kyunki last add kiya)
+```
+
+**Node.js/Express analogy:**
+```javascript
+// Express mein FIRST app.use = FIRST run (same order)
+app.use(requestIdMiddleware)   // first run
+app.use(loggerMiddleware)      // second run
+```
+
+---
+
+### Concept 2 — Handler Request ID kaise padhta hai
+
+`context.WithValue` → `context.Value` ka direct pipeline:
+
+```
+RequestID middleware:
+  ctx := context.WithValue(r.Context(), reqIDKey{}, "abc-123")
+  next.ServeHTTP(w, r.WithContext(ctx))
+         ↓
+Logger middleware:
+  id := ctx.Value(reqIDKey{}).(string)  // "abc-123"
+         ↓
+respond.go (JSON / Err):
+  id := middleware.RequestIDFromCtx(r.Context())  // "abc-123"
+  // envelope mein daal do:
+  json.Encode(envelope{RequestID: id, ...})
+         ↓
+Client:
+  Response header: X-Request-ID: abc-123
+  Response body:   {"success":true,"data":{...},"request_id":"abc-123"}
+```
+
+**Ek UUID — teen jagah dikhta hai:**
+1. `X-Request-ID` response header
+2. Log line mein `"request_id":"abc-123"`
+3. JSON response body mein `"request_id":"abc-123"`
+
+Client bug report karta hai: "mujhe ye error aaya" + request_id copy karta hai.
+Support engineer logs mein grep karta hai: ek second mein poori request ki story mil jaati hai.
+
+---
+
+### Concept 3 — responseWriter wrapper kyun?
+
+`http.ResponseWriter` ek interface hai. Iske paas status code nikalne ka koi method nahi hai agar handler ne already likh diya.
+
+```go
+// Standard ResponseWriter — status code likhne ke baad bahar nahi milta
+w.WriteHeader(201)
+// w.StatusCode()  ← ye method exist nahi karta!
+```
+
+**Solution:** Wrap karo — method override karo:
+```go
+type responseWriter struct {
+    http.ResponseWriter
+    status int  // apna capture field
+}
+
+func (rw *responseWriter) WriteHeader(status int) {
+    rw.status = status              // capture karo
+    rw.ResponseWriter.WriteHeader(status)  // real writer ko bhi bhejo
+}
+```
+
+Logger middleware:
+```go
+rw := &responseWriter{ResponseWriter: w, status: 200}
+next.ServeHTTP(rw, r)  // handler rw pe likhta hai
+// handler return ke baad:
+log.Info().Int("status", rw.status)...  // captured!
+```
+
+**Python WSGI analogy:** `start_response` ko wrap karna taaki status capture ho sake.
+**Node.js Express analogy:** `res.json` ya `res.send` ko monkey-patch karna.
+
+---
+
+### Concept 4 — Consistent Envelope
+
+Pehle wali respond.go: `JSON(w, status, data)` — simple, no envelope.
+
+Nayi respond.go: `JSON(w, r, status, data)` — `r *http.Request` isliye add kiya ki context se request_id nikaal sakein.
+
+```go
+// Success response:
+{
+  "success":    true,
+  "data":       {"id": 1, "url": "https://example.com", ...},
+  "request_id": "550e8400-..."
+}
+
+// Error response:
+{
+  "success":    false,
+  "error":      "validation_failed",   ← machine-readable
+  "message":    "URL: url; IntervalSeconds: min=5",  ← human-readable
+  "request_id": "550e8400-..."
+}
+```
+
+**`json:"omitempty"` kya karta hai?**
+- Success pe: `error` aur `message` empty string hain → JSON mein field hi nahi aata
+- Failure pe: `data` nil hai → JSON mein field nahi aata
+- Result: har response mein sirf relevant fields
+
+**Python analogy:** `dataclass` with `Optional` fields + custom `__post_init__`
+**Node.js:** `JSON.stringify` skips `undefined` values
+
+---
+
+### Concept 5 — go-playground/validator
+
+Service layer mein bhi validation hai (e.g., `intervalSecs < 5`). Handler mein validator add kyun kiya?
+
+**Defense in depth (baar baar guard):**
+- Handler validator → fast fail, specific field errors, before service call
+- Service validation → domain rules (e.g., minimum 5 seconds for interval)
+
+Validator tags `createReq` struct pe:
+```go
+type createReq struct {
+    URL             string `json:"url"              validate:"required,url"`
+    Name            string `json:"name"             validate:"required,min=1,max=255"`
+    IntervalSeconds int    `json:"interval_seconds" validate:"required,min=5,max=86400"`
+    TimeoutSeconds  int    `json:"timeout_seconds"  validate:"required,min=1,max=60"`
+}
+```
+
+`url` tag kya check karta hai?
+- Scheme present hona chahiye (https:// ya http://)
+- Host present hona chahiye
+- `"example.com"` → fail (no scheme)
+- `"https://example.com"` → pass
+
+Error output:
+```
+URL: url; IntervalSeconds: min=5
+```
+(`validationMsg()` function `validator.ValidationErrors` ko readable string mein convert karta hai)
+
+---
+
+### Concept 6 — zerolog structured logging
+
+```go
+logger := zerolog.New(zerolog.ConsoleWriter{Out: os.Stdout}).
+    With().Timestamp().Logger()
+```
+
+`zerolog.ConsoleWriter` dev mein pretty print karta hai:
+```
+12:00:00 INF request method=GET path=/health status=200 latency_ms=0 request_id=abc-123
+12:00:01 INF request method=POST path=/api/monitors status=201 latency_ms=4 request_id=def-456
+12:00:02 WRN request method=GET path=/api/monitors/99 status=404 latency_ms=1 request_id=ghi-789
+```
+
+Production mein JSON output:
+```json
+{"level":"info","method":"POST","path":"/api/monitors","status":201,"latency_ms":4,"request_id":"def-456","time":"2025-07-14T12:00:01Z"}
+```
+
+**Log levels:**
+- `logger.Info()` → normal requests (2xx, 3xx)
+- `logger.Warn()` → client errors (4xx)
+- `logger.Error()` → server errors (5xx)
+
+**Builder pattern:** zerolog uses method chaining instead of variadic args:
+```go
+logger.Info().
+    Str("method", "POST").
+    Int("status", 201).
+    Msg("request")  // ← Msg() flushes the event; MUST call this
+```
+
+---
+
+### Gotchas
+
+| Gotcha | Solution |
+|---|---|
+| RequestID baad mein add kiya | Logger empty UUID log karta — RequestID PEHLE hona chahiye |
+| `WriteHeader` twice | `wroteHeader bool` guard se sirf ek baar fire karo |
+| `validate` singleton nahi | Har request pe `validator.New()` → reflection overhead. Package-level `var` use karo |
+| `fmt.Sprintf` ke saath `domain.ErrValidation` | `errors.Is()` wrapped errors traverse karta hai — `fmt.Errorf("%w: ...")` use karo |
+| `monitors == nil` list response | GORM empty query `nil` return kar sakta hai — `[]domain.Monitor{}` se safe empty array bhejo |
+| `json:"omitempty"` miss | Error aur success fields dono response mein dikhenge — noise for clients |
+
+---
+
+### Self-check Questions
+
+1. **Middleware order mein RequestID pehle aur Logger baad mein kyun hai?** Agar ulta karo to kya hoga?
+
+2. **`responseWriter` wrapper kyun banaya?** `http.ResponseWriter` seedha status code expose kyun nahi karta?
+
+3. **`context.WithValue` mein custom struct type `reqIDKey{}` kyun use kiya?** String `"requestID"` se kya problem hoti?
+
+4. **Middleware "way in" pe outermost se innermost kyu chalta hai — "way out" pe kyun ulta?**
+
+5. **`validate:"required,url"` mein `"example.com"` kyun fail hoga?** Kya pass karna hoga?
+
+6. **`json:"omitempty"` ke bina envelope kaisi dikhegi?** Kya farak padta hai client ko?
+
+---
+
+### What's next — Stage 8
+
+- Handler unit tests with `httptest.NewRecorder` + mock `MonitorService`
+- `GET /api/monitors/{id}/incidents` endpoint
+- Rate limiting middleware
+
+---
+
+## Stage 8 — Redis cache + rate limiting
+
+### Kya banaya
+
+| File | Kya karta hai |
+|---|---|
+| `internal/platform/cache/cache.go` | go-redis wrapper: Get/Set/Del/Incr/Expire + `ErrCacheMiss` sentinel |
+| `internal/service/monitor_service.go` | cache-aside in `GetMonitor`; `cacheDelMonitor` on pause/resume/delete |
+| `internal/middleware/ratelimit.go` | INCR+EXPIRE pattern: 429 after limit, `X-RateLimit-*` headers |
+| `cmd/server/main.go` | Redis connect (graceful degrade), cache→service, RateLimit on `/api` |
+
+---
+
+### Concept 1 — Cache-aside pattern
+
+Cache-aside = **application controls caching** (not the DB driver or ORM).
+
+**READ path (miss):**
+```
+GET /api/monitors/42
+  → service.GetMonitor(ctx, 42, userID)
+      → cache.Get("pulse:monitor:42")  → ErrCacheMiss
+      → monitors.ByID(ctx, 42)         → DB query (slow)
+      → cache.Set("pulse:monitor:42", json, 30s)
+      → return monitor
+```
+
+**READ path (hit):**
+```
+GET /api/monitors/42  (again, within 30s)
+  → service.GetMonitor(ctx, 42, userID)
+      → cache.Get("pulse:monitor:42")  → "{...json...}"  ← DB nahi chua!
+      → json.Unmarshal → *domain.Monitor
+      → ownership check
+      → return monitor
+```
+
+**WRITE path (invalidation):**
+```
+PATCH /api/monitors/42/pause
+  → service.PauseMonitor(ctx, 42, userID)
+      → monitors.UpdateStatus(ctx, 42, false)  → DB update
+      → cache.Del("pulse:monitor:42")           → key remove
+```
+
+Ab next GET pe cache miss hoga → fresh data DB se aayega.
+
+**Socho ek newspaper ki tarah:**
+- Cache = newspaper stand ka copy (fast, stale ho sakta hai)
+- DB = printing press (slow, always authoritative)
+- Cache-aside = "stand pe copy hai? wahi do. nahi hai? press se nikalo aur stand pe rakh do."
+
+**Python/Redis analogy:**
+```python
+def get_monitor(id):
+    cached = redis.get(f"pulse:monitor:{id}")
+    if cached:
+        return json.loads(cached)          # cache hit
+    monitor = db.query(Monitor, id)        # cache miss → DB
+    redis.setex(f"pulse:monitor:{id}", 30, json.dumps(monitor))
+    return monitor
+```
+
+---
+
+### Concept 2 — TTL (Time To Live) kyun chahiye?
+
+TTL = Redis ke andar ek countdown timer. Countdown khatam → key automatically delete.
+
+```
+SET pulse:monitor:42 "..." EX 30
+              ↓
+  30 seconds baad:  GET pulse:monitor:42 → (nil) = ErrCacheMiss
+```
+
+**TTL ke bina kya hoga?**
+- Monitor pause kiya → cache.Del kiya → theek hai
+- Lekin: monitor kuch aur jagah se update hua (direct DB, migration, etc.) → cache mein stale data hamesha rahega
+- TTL = automatic safety net — worst case 30s baad fresh data
+
+**Short TTL (30s) kyun?**
+- Monitor zyada change nahi hota (URL, interval — rarely updated)
+- 30s enough hai ki burst of requests (10 in 5s) DB ko na chhue
+- `active` field change hoti hai pause/resume pe — invalidation handle karta hai
+
+---
+
+### Concept 3 — Invalidation AFTER DB write kyun?
+
+```go
+// GALAT order:
+cache.Del(key)          // 1. cache clear
+monitors.Update(...)    // 2. DB update (fails!)
+// Result: cache cleared, DB old — next GET repopulates with old DB value
+//         User got 204 success but DB didn't change → data inconsistency
+
+// SAHI order:
+monitors.Update(...)    // 1. DB update (succeeds)
+cache.Del(key)          // 2. cache clear
+// Result: DB has new data; next GET fetches fresh data from DB
+```
+
+**Rule: Pehle DB likhho, phir cache invalidate karo.**
+
+Ek edge case: DB update succeed, cache.Del fail → stale cache for max TTL (30s). Acceptable kyunki:
+1. TTL baad automatically expire hoga
+2. 30s stale data is much better than data inconsistency
+
+---
+
+### Concept 4 — INCR kyun GET+SET se safe hai
+
+**GET + SET — race condition:**
+
+```
+Goroutine A              Goroutine B          Redis key
+GET rl:1.2.3.4  → 5                          5
+                    GET rl:1.2.3.4  → 5      5    ← A ne likha nahi abhi!
+SET rl:1.2.3.4 6                              6
+                    SET rl:1.2.3.4 6          6    ← B ne A ka write overwrite kiya
+```
+Result: do requests aaye, sirf ek count hua. Rate limiter bypass ho sakta hai.
+
+**INCR — atomic (Redis single-threaded execution):**
+
+```
+Goroutine A              Goroutine B          Redis key
+INCR rl:1.2.3.4 → 6                          6    ← read+write atomic
+                    INCR rl:1.2.3.4 → 7      7    ← A ka result already reflected
+```
+Result: do requests → count 6 aur 7 — correct.
+
+**Redis single-threaded** matlab: ek time pe sirf ek command execute hota hai. INCR = read+add+write ek hi operation mein. No two goroutines can interleave inside it.
+
+**Mutex Go mein kyun nahi chahiye?**
+Mutex sirf ek process ke andar goroutines protect karta hai. Multiple app servers (3 pods in Kubernetes) mein Go mutex kuch nahi karega — lekin Redis INCR tab bhi atomic rahega kyunki Redis ek single server hai.
+
+```
+App Server 1 → INCR "pulse:rl:1.2.3.4:bucket" → 1
+App Server 2 → INCR "pulse:rl:1.2.3.4:bucket" → 2   ← correct!
+App Server 3 → INCR "pulse:rl:1.2.3.4:bucket" → 3   ← correct!
+```
+
+---
+
+### Concept 5 — EXPIRE sirf count==1 pe kyun?
+
+```go
+count, _ := c.Incr(ctx, key)
+if count == 1 {
+    c.Expire(ctx, key, window)  // sirf ek baar!
+}
+```
+
+Agar har request pe Expire call karo:
+
+```
+t=0s  INCR → 1,  EXPIRE key 60s  → key expires at t=60s
+t=5s  INCR → 2,  EXPIRE key 60s  → key expires at t=65s  ← window pushed!
+t=10s INCR → 3,  EXPIRE key 60s  → key expires at t=70s  ← further pushed!
+...continues forever while traffic flows...
+```
+Key kabhi expire nahi hoga — rate limit window kabhi reset nahi hoga.
+
+**count==1 pe sirf ek baar:**
+```
+t=0s  INCR → 1,  EXPIRE key 60s  → key expires at t=60s
+t=5s  INCR → 2   (no EXPIRE call)
+t=10s INCR → 3   (no EXPIRE call)
+...
+t=60s key expires → next INCR creates fresh key → new window
+```
+
+---
+
+### Concept 6 — Graceful degradation (fail-open)
+
+```go
+var cacheClient *cache.Cache
+if c, err := cache.New(cfg.RedisURL); err != nil {
+    logger.Warn().Err(err).Msg("redis unavailable — running without cache")
+} else {
+    cacheClient = c
+}
+svc := service.NewMonitorService(..., cacheClient)  // nil is OK
+```
+
+Service mein:
+```go
+if s.cache != nil {
+    if m, ok := s.cacheGetMonitor(ctx, id); ok {
+        return m, nil  // cache hit
+    }
+}
+// cache nil ya miss → DB se lo
+```
+
+RateLimit middleware:
+```go
+if c == nil {
+    next.ServeHTTP(w, r)  // no cache → no rate limit → proceed
+    return
+}
+```
+
+**Fail-open** = Redis down hone pe service kaam karta rahega (sirf thoda slow). DB hi source of truth hai.
+
+**Fail-closed** = Redis down → service completely down. Ye wrong hai — cache is an optimization, not a requirement.
+
+---
+
+### Rate-limit response headers
+
+```
+X-RateLimit-Limit:     200          ← max per window
+X-RateLimit-Remaining: 197          ← requests left
+X-RateLimit-Reset:     1705234620   ← Unix timestamp when window resets
+```
+
+429 response:
+```json
+{
+  "success": false,
+  "error": "rate_limit_exceeded",
+  "message": "too many requests — retry after 45s",
+  "request_id": "abc-123"
+}
+```
+
+`Retry-After` header bhi set hota hai — clients API ko intelligently back off karte hain.
+
+---
+
+### Gotchas
+
+| Gotcha | Solution |
+|---|---|
+| Cache invalidate BEFORE DB write | Stale data repopulates on next read. Always Del AFTER DB write. |
+| EXPIRE on every request | Window kabhi reset nahi hoga. EXPIRE sirf count==1 pe. |
+| GET+SET for rate limiting | Race condition — use INCR (atomic). |
+| Redis nil cache panic | `if s.cache == nil` guard har jagah. |
+| Forgetting TTL on Set | Key grows forever — always pass TTL. |
+| Long TTL for mutable data | 30s is short enough; pause/resume/delete invalidation handles the rest. |
+
+---
+
+### Self-check Questions
+
+1. **Cache-aside hit path trace karo step by step.** DB kab chhuta nahi?
+
+2. **INCR kyun GET+SET se safe hai?** Race condition explain karo.
+
+3. **EXPIRE sirf count==1 pe kyun call karte hain?** Har request pe call karne se kya hoga?
+
+4. **Cache invalidation DB write AFTER kyun?** Pehle karne se kya problem?
+
+5. **Redis down hone pe kya hoga?** Service crash karegi?
+
+6. **3 app servers (Kubernetes pods) mein Go mutex rate limiting kyun fail hoga?** Redis INCR kyun kaam karega?
+
+---
+
+## Stage 9 — Incidents & Notifications (Transactions + Interface)
+
+### What we built
+
+| File | Change |
+|------|--------|
+| `internal/domain/models.go` | Added `Status string` field to `Monitor` ("unknown" / "up" / "down") |
+| `internal/repository/tx.go` | NEW — `Transactor` interface + `gormTransactor` using `db.Transaction()` |
+| `internal/notifier/notifier.go` | NEW — `Notifier` interface + `LogNotifier` (zerolog) |
+| `internal/repository/monitor_repo.go` | Added `SetStatus(ctx, id, status)` to interface + implementation |
+| `internal/repository/incident_repo.go` | Made `Create` and `Resolve` transaction-aware via `txDB(ctx, r.db)` |
+| `internal/service/monitor_service.go` | Added `transactor`/`notifier` fields; rewrote `RecordOutcome` Step 3 |
+| `cmd/server/main.go` | Wired `repository.NewTransactor(db)` and `notifier.NewLogNotifier(logger)` |
+
+---
+
+### Concept 1 — GORM Transactions (`db.Transaction`)
+
+**The core mechanic:**
+
+```go
+db.Transaction(func(tx *gorm.DB) error {
+    tx.Create(&incident)         // Step A
+    tx.Update("status", "down")  // Step B
+    return nil                   // ← nil = COMMIT; error = ROLLBACK
+})
+```
+
+GORM wraps your function with:
+- `BEGIN` before calling your function
+- `COMMIT` if you return `nil`
+- `ROLLBACK` if you return any error (or if your function panics)
+
+**Python/SQLAlchemy equivalent:**
+```python
+with session.begin():
+    session.add(incident)
+    monitor.status = "down"
+# COMMIT on __exit__(None), ROLLBACK on exception
+```
+
+**Node.js/Knex equivalent:**
+```javascript
+await knex.transaction(async trx => {
+    await trx('incidents').insert(incident)
+    await trx('monitors').where({ id }).update({ status: 'down' })
+})
+// COMMIT on resolve, ROLLBACK on reject
+```
+
+---
+
+### Concept 2 — Why Two Writes MUST Be Atomic
+
+**UP→DOWN transition creates TWO separate DB writes:**
+1. `INSERT INTO incidents (monitor_id, started_at, ...)`
+2. `UPDATE monitors SET status='down' WHERE id=?`
+
+**Without a transaction — crash between writes:**
+```
+Write 1 ✅  Incident row created → "monitor is DOWN"
+[CRASH]
+Write 2 ❌  monitors.status stays "up"
+```
+
+Result: incident table says "DOWN", monitors table says "UP" → **inconsistent data**. The API would show the monitor as "up" while an active incident record sits in the DB.
+
+**With a transaction:**
+```
+BEGIN
+  Write 1 — incident INSERT (not yet committed)
+  Write 2 — status UPDATE  (not yet committed)
+COMMIT ← both land together, atomically
+```
+
+Either both writes are visible, or neither. No half-written state can exist.
+
+---
+
+### Concept 3 — The `Transactor` Pattern (hiding `*gorm.DB` from the service)
+
+The service layer must never import `gorm.io/gorm` — that would couple business logic to a DB driver.
+
+**How we solve it:**
+
+```
+service ──uses──► repository.Transactor  (interface, no gorm import needed)
+                         ▲
+                         │ implements
+                  gormTransactor (in repository pkg — gorm allowed here)
+```
+
+The `Transactor` interface exposes only:
+```go
+type Transactor interface {
+    RunInTx(ctx context.Context, fn TxFn) error
+}
+```
+
+`service.RecordOutcome` calls it like this:
+```go
+s.transactor.RunInTx(ctx, func(ctx context.Context) error {
+    s.incidents.Create(ctx, incident)    // uses tx from ctx
+    s.monitors.SetStatus(ctx, id, "down") // uses tx from ctx
+    return nil // commit
+})
+```
+
+No `*gorm.DB` anywhere in the service. The service doesn't know or care how the transaction is implemented.
+
+---
+
+### Concept 4 — Context-carried Transaction (`txDB`)
+
+The trick is storing the `*gorm.DB` transaction handle inside `context.Context`:
+
+```go
+// Inside RunInTx:
+txCtx := context.WithValue(ctx, txKey{}, tx)  // store tx in ctx
+fn(txCtx)                                       // pass to repo methods
+
+// Inside each repo method:
+db := txDB(ctx, r.db)  // extract tx if present; otherwise use r.db
+db.WithContext(ctx).Create(...)
+```
+
+**Why an unexported struct key?**
+```go
+type txKey struct{}  // zero-size, unexported
+```
+Using `"tx"` (a string) as the key would collide with any other package that also stores `"tx"` in context. An unexported struct type can only be referenced from within the `repository` package — guaranteed uniqueness.
+
+**Python analogy:** SQLAlchemy uses scoped sessions (thread-local) to share the same session across function calls. Context is Go's equivalent of thread-local.
+
+---
+
+### Concept 5 — `Notifier` Interface (swappable alerting)
+
+```go
+type Notifier interface {
+    Notify(ctx context.Context, m domain.Monitor, downSince time.Time) error
+}
+```
+
+Today: `LogNotifier` — writes a zerolog error line.  
+Tomorrow: `EmailNotifier`, `SlackNotifier`, `FanOutNotifier` — zero service changes.
+
+**Service injects `notifier.Notifier`, not `*LogNotifier`:**
+```go
+type monitorService struct {
+    notifier notifier.Notifier  // interface — any implementation works
+}
+```
+
+This is the same pattern as repositories in Stage 5. Interface = swap point.
+
+---
+
+### Concept 6 — Notify AFTER the Transaction Commits
+
+**Wrong approach (notify inside the transaction):**
+```
+BEGIN
+  INSERT incident         ← OK
+  UPDATE status='down'    ← OK
+  CALL slack.Send(alert)  ← external HTTP call
+ROLLBACK (some error)     ← incident and status rolled back
+                          ← but Slack already sent the alert! 😱
+```
+
+The on-call engineer gets paged for a phantom outage — the data was never saved.
+
+**Right approach (notify after commit):**
+```go
+if txErr := s.transactor.RunInTx(ctx, func(ctx context.Context) error {
+    s.incidents.Create(ctx, incident)
+    s.monitors.SetStatus(ctx, id, "down")
+    return nil
+}); txErr != nil { return txErr }
+
+// Transaction committed — now safe to call external systems.
+s.notifier.Notify(ctx, monitor, downSince)  // ← happens OUTSIDE the transaction
+```
+
+**Rule:** Side-effects that can't be rolled back (HTTP calls, emails, queue messages) must happen AFTER the transaction commits.
+
+**Python/Django equivalent:**
+```python
+with transaction.atomic():
+    Incident.objects.create(...)
+    Monitor.objects.filter(id=id).update(status="down")
+# committed — safe to send email now
+send_alert(monitor)
+```
+
+---
+
+### Concept 7 — `domain.Monitor.Status` field
+
+Added to `domain.Monitor`:
+```go
+Status string `gorm:"not null;default:'unknown';size:10" json:"status"`
+```
+
+Three values:
+| Value | Meaning |
+|-------|---------|
+| `"unknown"` | Monitor just created, never checked |
+| `"up"` | Last probe succeeded, no open incident |
+| `"down"` | Last probe failed, incident is open |
+
+`gorm:"default:'unknown'"` means AutoMigrate sets the DB column default — existing rows get the value automatically on schema migration.
+
+**Why separate from `Active bool`?**
+
+| Field | Controls |
+|-------|---------|
+| `active` | Whether the scheduler checks this monitor |
+| `status` | What the last probe result was |
+
+A paused monitor (`active=false`) still has `status="down"` if it was down when paused. They're orthogonal.
+
+---
+
+### Hinglish recap — Tujhe kya samajh aaya
+
+Yaar, socho ek situation: tumhara monitor down ho gaya. Do cheezein honi chahiye ek saath:
+
+1. **Incident row banana** — "haan yaar, yeh monitor 3:42pm pe down hua"
+2. **Monitor ka status update karna** — `"down"` set karna API ke liye
+
+**Problem:** Dono alag-alag DB writes hain. Agar beech mein kuch crash ho gaya:
+- Incident bana, status nahi bana → API pe "UP" dikhta hai, incident row bola "DOWN" — confusing!
+- Status bana, incident nahi bana → on-call ko pata hi nahi kab down hua!
+
+**Solution: Transaction** — dono writes ek packet mein bandh karo.
+
+```
+Transaction start karo
+  Write 1: incident insert karo
+  Write 2: status "down" karo
+Transaction commit karo → DONO ek saath land karte hain
+```
+
+Agar kuch bhi fail ho → **ROLLBACK** → dono writes cancel. Koi half-baked state nahi.
+
+**GORM mein kaise?**
+```go
+db.Transaction(func(tx *gorm.DB) error {
+    // nil return karo → COMMIT
+    // error return karo → ROLLBACK (GORM automatically karta hai)
+    return nil
+})
+```
+
+**Notifier kab call karte ho?**  
+Transaction ke BAAD. Socho: agar email pehle bheja, phir transaction rollback ho gaya... innocent engineer ko fake alert mila. Transaction commit ke baad notify karo — "agar alert gaya, toh data pakka save hai."
+
+**Notifier interface kyun?**  
+Aaj `LogNotifier` hai (bas log karta hai). Kal `SlackNotifier` ya `EmailNotifier` banana ho toh service ka ek line bhi nahi badlega — sirf `main.go` mein naya notifier inject karo.
+
+Yahi hai **dependency inversion** — service ko parwah nahi "kaun notify karega", sirf "Notify() ka ek method milna chahiye."
+
+---
+
+### Self-check questions — Stage 9
+
+1. **Transaction ka callback `nil` return karne se kya hota hai? `error` return karne se?**
+
+2. **`txDB(ctx, r.db)` function kya karta hai? Ise sirf `r.db` use karne se kya fark hai?**
+
+3. **`txKey struct{}` unexported kyun hai? `"tx"` string use karne se kya problem?**
+
+4. **Notifier ko transaction ke andar call karne ki kya problem hai?**
+
+5. **`Active bool` aur `Status string` dono alag-alag kyun rakhte hain?**
+
+6. **`gorm:"default:'unknown'"` kya karta hai existing rows ke liye jab migration chalti hai?**
+
+---
+
+### What's next — Stage 10
+
+- Handler unit tests (`httptest.NewRecorder`, mock `MonitorService`)
+- `GET /api/monitors/{id}/incidents` endpoint
+- Prometheus metrics (`/metrics` endpoint)
+
+---
+
+## Stage 10 — JWT Auth (already built in Stage 7)
+
+> **Note:** Stage 10's spec (register, login, auth middleware, protected monitor routes) was implemented in full during Stage 7. This section documents the concepts and answers the pre-check questions.
+
+### Files that implement Stage 10
+
+| File | Role |
+|------|------|
+| `internal/service/user_service.go` | bcrypt hashing, JWT signing |
+| `internal/handler/auth_handler.go` | `POST /api/auth/register`, `POST /api/auth/login` |
+| `internal/middleware/auth.go` | JWT verify middleware, `UserIDFromCtx` |
+| `cmd/server/main.go` | Route wiring: public `/auth/*`, protected `/monitors` |
+
+---
+
+### Concept 1 — bcrypt password hashing
+
+**One-way hash — you can NEVER reverse it:**
+
+```go
+hashed, _ := bcrypt.GenerateFromPassword([]byte(password), 12)
+// stored in DB: "$2a$12$<22-char-salt><31-char-hash>"
+
+bcrypt.CompareHashAndPassword([]byte(storedHash), []byte(inputPassword))
+// re-hashes inputPassword with the embedded salt, compares in constant time
+```
+
+**Cost 12 = ~250ms on modern hardware.** Each +1 to cost doubles the work.
+- Cost 4: brute-force is cheap (attacker can test millions of passwords/second)
+- Cost 12: standard for web apps (login feels instant, brute-force is expensive)
+- Cost 15+: login feels slow
+
+**The salt is embedded in the hash string itself.** No separate salt column needed.
+
+**Python:** `bcrypt.hashpw(password.encode(), bcrypt.gensalt(rounds=12))`  
+**Node.js:** `await bcrypt.hash(password, 12)`
+
+---
+
+### Concept 2 — JWT structure (header.payload.signature)
+
+A JWT is three base64url strings joined by `.`:
+
+```
+eyJhbGciOiJIUzI1NiJ9  .  eyJ1c2VyX2lkIjoxfQ  .  abc123xyz
+    ↑ header                ↑ payload               ↑ signature
+  {"alg":"HS256"}        {"user_id":1,"exp":...}   HMAC-SHA256 of header+payload
+```
+
+**Signing (login):**
+```go
+claims := PulseClaims{
+    UserID: u.ID,
+    RegisteredClaims: jwt.RegisteredClaims{
+        ExpiresAt: jwt.NewNumericDate(now.Add(jwtTTL)),
+        Issuer: "pulse",
+    },
+}
+token := jwt.NewWithClaims(jwt.SigningMethodHS256, claims)
+tokenStr, _ := token.SignedString(jwtSecret)
+```
+
+**Verifying (middleware):**
+```go
+claims := &PulseClaims{}
+token, err := jwt.ParseWithClaims(tokenStr, claims, keyFunc)
+// ParseWithClaims: decodes → verifies signature → checks expiry
+```
+
+**Python:** `jwt.encode(payload, secret, algorithm="HS256")` / `jwt.decode(token, secret, algorithms=["HS256"])`  
+**Node.js:** `jwt.sign(payload, secret, { expiresIn: "24h" })` / `jwt.verify(token, secret)`
+
+---
+
+### Concept 3 — The "none algorithm" attack (why the signing method check matters)
+
+**The attack:**
+
+```
+Attacker crafts a token:
+  header:  { "alg": "none" }
+  payload: { "user_id": 1, "exp": 9999999999 }
+  signature: (empty)
+```
+
+If the JWT library skips the algorithm check, it calls the keyfunc with a "none" method, gets back the secret, then says "oh, this uses 'none' — no signature needed" and **accepts the token as valid** with no verification at all.
+
+**The guard in auth.go:**
+```go
+func(t *jwt.Token) (any, error) {
+    if _, ok := t.Method.(*jwt.SigningMethodHMAC); !ok {
+        return nil, errors.New("unexpected signing method")
+    }
+    return jwtSecret, nil
+}
+```
+
+If `t.Method` is anything other than `*jwt.SigningMethodHMAC` — "none", RSA, ECDSA — the keyfunc returns an error **before** the secret is used. `jwt.ParseWithClaims` sees the error and fails the parse.
+
+**Same rule in other languages:**
+- Python: `jwt.decode(token, secret, algorithms=["HS256"])` — explicitly whitelist algorithms
+- Node.js: `jwt.verify(token, secret, { algorithms: ["HS256"] })` — same
+
+---
+
+### Concept 4 — `claims["sub"]` float64 problem and how `PulseClaims` avoids it
+
+**The problem with `jwt.MapClaims`:**
+
+```go
+// MapClaims = map[string]interface{}
+// JSON decoder maps ALL numbers to float64 in Go
+claims := jwt.MapClaims{}
+jwt.ParseWithClaims(tokenStr, &claims, ...)
+
+userID := claims["user_id"]   // type: interface{}
+// You need:
+id := uint(claims["user_id"].(float64))  // awkward; loses precision above 2^53
+```
+
+This happens because JSON has no integer type — `42` and `42.0` are the same. Go's `encoding/json` always decodes JSON numbers into `float64` when the target is `interface{}`.
+
+**How `PulseClaims` avoids it:**
+
+```go
+type PulseClaims struct {
+    UserID uint `json:"user_id"`  // ← Go knows the target type at decode time
+    jwt.RegisteredClaims          // handles exp, iat, iss natively
+}
+
+claims := &PulseClaims{}
+jwt.ParseWithClaims(tokenStr, claims, ...)
+
+userID := claims.UserID  // ← already uint; no conversion, no type assertion
+```
+
+When you parse into a typed struct, `encoding/json` decodes the JSON number directly into `uint` — no float64 intermediate.
+
+**Rule of thumb:** Always parse JWT into a typed struct when you have a known schema. Use `MapClaims` only when the schema is dynamic.
+
+---
+
+### Concept 5 — The login → token → verify flow end-to-end
+
+```
+1. Client          →   POST /api/auth/login {"email":"…","password":"…"}
+2. AuthHandler     →   h.users.Login(ctx, email, password)
+3. UserService     →   users.ByEmail(ctx, email)              DB fetch
+4. UserService     →   bcrypt.CompareHashAndPassword(...)     constant-time compare
+5. UserService     →   jwt.NewWithClaims(HS256, PulseClaims{UserID: u.ID, ...})
+6. UserService     →   token.SignedString(jwtSecret)          HMAC-SHA256 sign
+7. AuthHandler     ←   returns {"token":"eyJ..."}
+
+─── next request ───────────────────────────────────────────────────────────────
+
+8. Client          →   GET /api/monitors  Authorization: Bearer eyJ...
+9. Auth middleware →   jwt.ParseWithClaims(tokenStr, &claims, keyFunc)
+                         a. Decode header + payload
+                         b. Check alg == HMAC (none-algorithm guard)
+                         c. Verify HMAC-SHA256 signature
+                         d. Check ExpiresAt > now
+10. Auth middleware→   context.WithValue(ctx, userIDKey, claims.UserID)
+11. MonitorHandler →   middleware.UserIDFromCtx(r.Context())  → userID = 1
+12. MonitorService →   ListMonitors(ctx, userID=1, ...)       → only user 1's monitors
+```
+
+The server never stores sessions. Every request is self-contained — the token carries the identity.
+
+---
+
+### Hinglish recap — Tujhe kya samajh aaya
+
+Bhai, yeh poora flow samjho:
+
+**Registration pe kya hota hai?**
+- Password `bcrypt.GenerateFromPassword` se hash hota hai — original password permanently gone.
+- Hash DB mein save hota hai. Koi plain password kabhi DB mein nahi jaata.
+- `cost=12` matlab attacker ke liye ek password try karna 250ms lagta hai. 1 crore tries = 29 din.
+
+**Login pe kya hota hai?**
+- DB se hashed password fetch karo.
+- `bcrypt.CompareHashAndPassword` — input password ko same salt se dobara hash karo, compare karo.
+- Match? → JWT sign karo aur return karo.
+- JWT = credit card jaisa — tumhare credentials baar baar nahi bhejna, token bhejo.
+
+**Auth middleware kya karta hai?**
+- Har protected request pe: "Authorization: Bearer eyJ..." header padhta hai.
+- JWT verify karta hai: signature sahi hai? Expire nahi hua?
+- `alg=none` attack guard: sirf HMAC tokens accept karo, baaki sab reject.
+- UserID context mein daalta hai → handler `UserIDFromCtx` se nikalta hai.
+
+**`claims["sub"]` float64 kyun?**
+- JSON mein integers ka koi alag type nahi. `42` aur `42.0` same hai.
+- Go ke `encoding/json` har number ko `float64` mein decode karta hai jab target `interface{}` ho.
+- Fix: typed struct `PulseClaims{UserID uint}` — JSON directly `uint` mein jaata hai.
+
+---
+
+### Self-check questions — Stage 10
+
+1. **bcrypt `CompareHashAndPassword` ko original password kyun nahi chahiye? Salt kahan se aata hai?**
+
+2. **JWT ka `alg=none` attack kya hai? Guard kaisa kaam karta hai?**
+
+3. **`jwt.MapClaims` se `claims["user_id"]` nikalne pe float64 kyun milta hai?**
+
+4. **Server ke paas session store kyun nahi hai? Stateless auth ka matlab kya hai?**
+
+5. **bcrypt cost 4 vs cost 12 — dono mein kya fark hai? Kya cost 20 use karna chahiye?**
+
+---
+
+### What's next — Stage 11
+
+- Handler unit tests (`httptest.NewRecorder`, mock `MonitorService`)
+- `GET /api/monitors/{id}/incidents` endpoint
+- Prometheus metrics (`/metrics` endpoint)
+
+---
+
+## Stage 11 — Logging, Graceful Shutdown, /health
+
+### What we built
+
+| File | Change |
+|------|--------|
+| `internal/platform/cache/cache.go` | Added `Ping(ctx) error` — used by health handler |
+| `internal/service/monitor_service.go` | Injected `zerolog.Logger`; replaced two `fmt.Printf` with `s.log.Warn()` |
+| `cmd/server/main.go` | Replaced `fmt.Fprintf` in `due` closure; real `/health` pinging Postgres + Redis |
+
+---
+
+### Concept 1 — Structured logging with zerolog
+
+**The problem with `fmt.Printf`:**
+```
+⚠️  record outcome: update next check for monitor 42: pq: connection reset
+```
+This is a plain string. You can't filter it by monitor_id, you can't search by error type, you can't count "how many times did this happen for monitor 42 in the last hour?"
+
+**Structured logging (zerolog):**
+```go
+s.log.Warn().
+    Err(err).
+    Uint("monitor_id", o.Job.MonitorID).
+    Msg("record outcome: update next check failed (non-fatal)")
+```
+
+Produces JSON (in production):
+```json
+{"level":"warn","error":"pq: connection reset","monitor_id":42,"message":"record outcome: update next check failed (non-fatal)","time":"2026-07-14T10:23:01Z"}
+```
+
+Now Datadog/Loki/Splunk can query: `level:warn AND monitor_id:42` — instant filter. Fields are typed, not embedded in a string.
+
+**zerolog builder pattern:**
+- Each `.Str(k, v)` / `.Uint(k, v)` / `.Err(err)` adds a JSON field to the event buffer.
+- `.Msg("...")` is the terminal call — flushes the event. Nothing is written until `.Msg()`.
+- `logger.Info()` creates a new event; `.Error()` / `.Warn()` for higher severity.
+
+**Python:** `logger.warning("...", extra={"monitor_id": 42})`  
+**Node.js/pino:** `log.warn({ monitorId: 42, err }, "...")`
+
+---
+
+### Concept 2 — Why inject logger into the service (not use a global)
+
+We added `log zerolog.Logger` to `monitorService` and pass it in `NewMonitorService`.
+
+**Global logger problem:**
+```go
+// Anywhere in the codebase:
+log.Error().Msg("something")   // zerolog/log global
+```
+- Tests can't replace it — every test shares the same global logger.
+- No per-component context (can't tag all service logs with `"component":"monitor_service"`).
+- Harder to test that a specific warning was emitted.
+
+**Injected logger:**
+```go
+// In tests:
+testLog := zerolog.Nop()   // discard all logs — no noise in test output
+svc := service.NewMonitorService(..., testLog)
+```
+
+This is the same dependency-injection principle as repositories — any dependency that has side effects (I/O, logging) should be injected, not imported as a global.
+
+---
+
+### Concept 3 — Graceful shutdown: the exact sequence
+
+```
+SIGTERM received
+      │
+      ▼
+pipelineCancel()          ← cancels the scheduler context
+      │
+      │  scheduler goroutine sees ctx.Done() → stops ticking
+      │  workers drain their current check (takes ≤ checkTimeout seconds)
+      │  outcomes channel closes → outcome recorder goroutine exits
+      ▼
+srv.Shutdown(10s timeout)  ← stops accepting new connections
+      │
+      │  in-flight HTTP requests complete
+      │  idle connections close
+      ▼
+main() returns             ← process exits cleanly
+```
+
+**Why cancel the pipeline BEFORE `srv.Shutdown`?**
+
+Option A (current — pipeline first):
+- Pipeline cancel is non-blocking — it just signals the context.
+- Workers finish their current check concurrently while HTTP server is still live.
+- `srv.Shutdown` then drains the HTTP layer.
+- Total time ≈ max(worker drain, HTTP drain) — they overlap.
+
+Option B (HTTP first):
+- `srv.Shutdown` blocks for up to 10s (HTTP drain).
+- THEN pipeline cancel + worker drain (another checkTimeout seconds).
+- Total time ≈ HTTP drain + worker drain — sequential, longer.
+
+Option A is better. Pipeline cancel is cheap (channel close), so doing it first costs nothing and gives workers the maximum time to finish.
+
+**In production, SIGTERM comes from:**
+- **Kubernetes:** rolling deploy / `kubectl delete pod` → sends SIGTERM to PID 1, waits `terminationGracePeriodSeconds` (default 30s), then SIGKILL.
+- **systemd:** `systemctl stop` → SIGTERM → SIGKILL after `TimeoutStopSec`.
+- **Docker:** `docker stop` → SIGTERM → SIGKILL after 10s.
+- **Cloud Run / ECS / Fly.io:** same SIGTERM → SIGKILL pattern.
+
+If your app ignores SIGTERM and takes > 30s to stop, Kubernetes sends SIGKILL — in-flight requests are dropped immediately. Graceful shutdown is what buys you those 30 seconds.
+
+---
+
+### Concept 4 — Real `/health` endpoint
+
+**What a health endpoint is for:**
+Load balancers and Kubernetes readiness probes call `/health` every few seconds. A non-200 response means "stop routing traffic to this pod."
+
+**Old (fake) health:**
+```go
+w.Write([]byte(`{"status":"ok"}`))  // always 200, even if DB is down
+```
+Useless — the load balancer routes traffic to a broken pod.
+
+**New (real) health:**
+```go
+// Ping Postgres:
+sqlDB, _ := db.DB()
+sqlDB.PingContext(ctx)   // sends "SELECT 1" equivalent
+
+// Ping Redis:
+c.Ping(ctx)              // sends Redis PING command
+```
+
+Response codes:
+- **200** — both OK → load balancer routes traffic here
+- **503** — Postgres or Redis down → load balancer routes AWAY from this pod
+
+**3-second deadline (`context.WithTimeout`):**
+Health checks must complete fast. If the DB is hung and the health check takes 30s, the load balancer thinks the pod is slow to respond and marks it as unhealthy regardless. A 3s deadline forces a fast failure.
+
+**`disabled` vs `down` for Redis:**
+If Redis wasn't configured (`cacheClient == nil`), the service deliberately runs without it — that's not a failure, it's a config choice. We report `"redis":"disabled"` and don't trigger 503. Only a configured-but-unreachable Redis returns `"down"`.
+
+**Python/Flask:**
+```python
+@app.route("/health")
+def health():
+    checks = {"postgres": ping_db(), "redis": ping_redis()}
+    code = 503 if "down" in checks.values() else 200
+    return jsonify({"status": "ok" if code == 200 else "degraded", **checks}), code
+```
+
+**Node.js/Express:**
+```javascript
+app.get("/health", async (req, res) => {
+    const pg = await pool.query("SELECT 1").then(() => "ok").catch(() => "down")
+    const redis = await redisClient.ping().then(() => "ok").catch(() => "down")
+    const ok = pg === "ok" && redis === "ok"
+    res.status(ok ? 200 : 503).json({ status: ok ? "ok" : "degraded", pg, redis })
+})
+```
+
+---
+
+### Hinglish recap — Tujhe kya samajh aaya
+
+**fmt.Printf hataaya kyun?**
+
+`fmt.Printf("monitor 42 failed: pq: connection reset")` — yeh ek plain string hai. Log aggregator ko kaise pata chalega ki "monitor_id=42" ke liye filter karna hai? Kaise count karein kitni baar yeh error aaya?
+
+`zerolog` structured events likhta hai:
+```json
+{"level":"warn","monitor_id":42,"error":"pq: connection reset"}
+```
+Ab Datadog mein `monitor_id:42 AND level:warn` search karo — seedha milega.
+
+**Logger inject kyun kiya service mein?**
+
+Global logger (`log.Error().Msg(...)`) use karne se test mein noise aata hai aur tum test nahi kar sakte "kya warning aayi ya nahi." Inject karo → test mein `zerolog.Nop()` pass karo (silent logger) → clean tests.
+
+**SIGTERM kya hota hai?**
+
+Kubernetes deploy karta hai → purana pod band karna hai → `SIGTERM` bhejta hai → "bhai, gracefully band ho ja." 30 seconds ke baad agar band nahi hua → `SIGKILL` → forcefully murder.
+
+Tumhara app agar SIGTERM handle nahi karta, in-flight HTTP requests drop ho jaate hain — client ko 502 milta hai.
+
+**Graceful shutdown ka sequence:**
+1. `pipelineCancel()` → scheduler ruk jaata hai, workers apna current check finish karte hain
+2. `srv.Shutdown(10s)` → HTTP server nayi connections nahi leta, purani finish hone deta hai
+3. Main exits → process cleanly band
+
+**Health check 200 vs 503 kyun important hai?**
+
+Load balancer har pod ko ping karta hai. 200 → "yahan traffic bhejo." 503 → "is pod se traffic hata lo, DB down hai." Agar fake 200 return karo toh broken pod pe traffic jaata rehega — users ko errors milte hain.
+
+---
+
+### Self-check questions — Stage 11
+
+1. **`fmt.Printf` se zerolog mein switch karne ka main faida kya hai log aggregation ke context mein?**
+
+2. **SIGTERM aur SIGKILL mein kya fark hai? Kya tum SIGKILL ko gracefully handle kar sakte ho?**
+
+3. **Pipeline `srv.Shutdown` se pehle kyun cancel karte hain? Ulta karne se kya hoga?**
+
+4. **Health check 503 return kare toh Kubernetes kya karta hai? 200 return karta raha toh kya problem?**
+
+5. **`context.WithTimeout(r.Context(), 3*time.Second)` health handler mein kyun use karte hain?**
+
+6. **Logger ko global kyun nahi rakhte? `zerolog.Nop()` tests mein kya karta hai?**
+
+---
+
+### What's next — Stage 12 (completed below)
+
+---
+
+## Stage 12 — Testing (Table-driven tests, mocking via interfaces, httptest, -race)
+
+### Kya bana Stage 12 mein?
+
+Teen cheezein test kiye:
+
+1. **Worker Pool** (`internal/monitor/pool_test.go`) — pehle se exist karta tha Stage 7 se. `fakeChecker` ek fake HTTP client hai jo real network call nahi karta — seedha success ya failure return karta hai. 20 jobs → 5 workers → sab 20 outcomes produce karte hain. Context cancel test bhi.
+
+2. **Service tests** (`internal/service/monitor_service_test.go`) — stub types har interface ke liye. Koi real DB, Redis, ya network nahi.
+
+3. **Handler tests** (`internal/handler/monitor_handler_test.go`) — `httptest.NewRecorder` aur `httptest.NewRequest` se fake HTTP. Handler function directly call karte hain — koi running server nahi.
+
+---
+
+### Interface mockability — ye kyun possible hai?
+
+Go mein interfaces **structural** hain (duck typing with compile-time checking):
+
+```go
+// service package mein define hai:
+type MonitorService interface {
+    CreateMonitor(ctx, userID, url, name string, interval, timeout int) (*Monitor, error)
+    ListMonitors(ctx, userID, page, pageSize int) ([]Monitor, error)
+    // ... 6 more methods
+}
+
+// test file mein:
+type mockMonitorSvc struct {
+    createMonitorFn func(...) (*domain.Monitor, error)
+}
+
+func (m *mockMonitorSvc) CreateMonitor(...) (*domain.Monitor, error) {
+    return m.createMonitorFn(...)
+}
+// agar sab 8 methods implement karo → automatically MonitorService ban jaata hai
+// koi "implements" keyword nahi — Go check karta hai compile time pe
+
+var _ service.MonitorService = (*mockMonitorSvc)(nil) // compile-time guarantee
+```
+
+**Python mein:** `unittest.mock.MagicMock(spec=MonitorService)` ya `Protocol` class.
+**Node.js mein:** `const mock = { createMonitor: jest.fn() }` — pure object, koi class nahi.
+
+---
+
+### Table-driven tests pattern
+
+```go
+// EK function, BAAR BAAR cases
+tests := []struct {
+    name      string
+    url       string
+    wantErrIs error
+}{
+    {"happy path", "https://example.com", nil},
+    {"empty url", "",                     domain.ErrValidation},
+    {"interval < 5", "https://x.com",    domain.ErrValidation},
+}
+
+for _, tt := range tests {
+    t.Run(tt.name, func(t *testing.T) {  // har case apna sub-test
+        // arrange → act → assert
+    })
+}
+```
+
+**Naya case add karna = ek line** table mein. Koi duplicate code nahi.
+
+**Python:** `@pytest.mark.parametrize("url,wantErr", [...])`
+**Node.js:** `test.each([...])`("test %s", ...)
+
+---
+
+### httptest flow
+
+```go
+// 1. In-memory ResponseWriter banao — koi socket nahi
+w := httptest.NewRecorder()
+
+// 2. Fake request banao — koi TCP nahi
+r := httptest.NewRequest(http.MethodPost, "/api/monitors",
+    strings.NewReader(`{"url":"https://example.com",...}`))
+
+// 3. Auth inject karo (real JWT bypass)
+r = r.WithContext(middleware.WithUserID(r.Context(), 1))
+
+// 4. Handler directly call karo
+h.Create(w, r)
+
+// 5. Recorder se assert karo
+if w.Code != 201 { t.Errorf(...) }
+```
+
+**Python/FastAPI:** `client = TestClient(app); resp = client.post("/monitors", json={...})`
+**Node.js:** `const resp = await request(app).post("/monitors").send({...})`
+**Go:** handler function directly call — koi server start nahi hota.
+
+---
+
+### -race flag — kyun critical hai?
+
+```bash
+go test ./... -race -cover
+```
+
+`-race` flag **runtime par** memory access ko instrument karta hai:
+- Har goroutine ke har read/write ko track karta hai
+- Agar do goroutines ek hi variable ko bina sync ke access karein → **race report**
+
+**Pulse mein kyun zaroori:**
+Worker pool goroutines + channels use karta hai. RecordOutcome production mein goroutines se call hota hai. Race condition silently data corrupt kar sakta hai — test normally pass bhi ho sakta hai.
+
+```
+WARNING: DATA RACE
+Write at 0x00c0001a4010 by goroutine 7:
+Read at 0x00c0001a4010 by goroutine 8:
+```
+
+**NOTE:** `-race` ke liye `gcc` (CGO) chahiye. Is machine pe GCC install nahi hai — isliye `go test ./... -cover` use kiya. Production Linux servers pe `sudo apt install gcc` karke `-race` run kar sakte hain.
+
+**Python:** `threading` module mein explicit locks lagane padte hain — no automatic detection.
+**Node.js:** single-threaded — data races usually possible nahi (Worker Threads alag baat hai).
+
+---
+
+### stubTransactor — transaction testing trick
+
+```go
+type stubTransactor struct{}
+
+func (stubTransactor) RunInTx(ctx context.Context, fn repository.TxFn) error {
+    return fn(ctx)  // ← critical: fn ko call karo, nil return mat karo
+}
+```
+
+**Kyon `fn(ctx)` call karna zaroori hai:**
+
+Service mein:
+```go
+s.transactor.RunInTx(ctx, func(ctx context.Context) error {
+    s.incidents.Create(ctx, incident)      // side-effect A
+    s.monitors.SetStatus(ctx, id, "down")  // side-effect B
+    return nil
+})
+```
+
+Agar stub `fn` call na kare aur seedha `nil` return kare:
+- Side-effect A aur B kabhi nahi chalenge
+- Test verify nahi kar sakta ki incident create hua ya status set hua
+
+`fn(ctx)` call karne se closure execute hota hai → stubs observe kar sakte hain.
+
+---
+
+### Test results
+
+```
+ok  github.com/nishantks908/pulse/internal/handler   coverage: 33.8%
+ok  github.com/nishantks908/pulse/internal/monitor   coverage: 93.8%
+ok  github.com/nishantks908/pulse/internal/service   coverage: 25.0%
+```
+
+Pool tests: 93.8% coverage (high — worker pool har path cover karta hai).
+Service tests: 25% — because `RecordOutcome` ke andar bahut branches hain (UP→DOWN, DOWN→UP, already DOWN, save check, update next check — sab ke test hain lekin overall function count zyada hai).
+Handler tests: 33.8% — Create + List cover hain; Get/Delete/Pause/Resume/Checks baaki hain.
+
+---
+
+### Self-check questions — Stage 12
+
+1. **`fakeChecker` pool ko deterministically test karne deta hai — matlab kya? Real HTTP checker kyun use nahi kar sakte tests mein?**
+
+2. **`var _ service.MonitorService = (*mockMonitorSvc)(nil)` line kya karti hai? Runtime ya compile time?**
+
+3. **`stubTransactor` mein `fn(ctx)` call karna zaroori kyun hai? Sirf `nil` return karne se kya problem?**
+
+4. **`httptest.NewRecorder()` aur real `http.ResponseWriter` mein kya fark hai?**
+
+5. **`-race` flag ke liye CGO kyun chahiye? Ye flag normally kaun si bugs pakadta hai?**
+
+6. **Table-driven tests ka sabse bada advantage kya hai? Ek naya edge case add karne ke liye kitni lines chahiye?**
+
+---
+
+### What's next — Stage 13
+
+- `GET /api/monitors/{id}/incidents` endpoint
+- Prometheus metrics (`/metrics` endpoint with request count, latency histograms)
+- Rate limiting middleware

@@ -79,6 +79,22 @@ type Monitor struct {
 	// Useful for pausing a monitor without deleting it.
 	Active bool `gorm:"not null;default:true" json:"active"`
 
+	// Status is the last known probe result: "unknown", "up", or "down".
+	// Updated atomically with Incident creation/resolution inside a GORM transaction
+	// (Stage 9). Separate from Active — you can pause (Active=false) a monitor
+	// while it still shows "down" from its last check.
+	//
+	// "unknown" = never checked yet (default after creation).
+	// "up"      = last probe succeeded; no open incident.
+	// "down"    = last probe failed; an Incident is open.
+	//
+	// gorm:"default:'unknown'" → DB default so existing rows get the value on migrate.
+	// size:10 → VARCHAR(10) — "unknown" is 7 chars; leaving headroom.
+	//
+	// Python: status = models.CharField(max_length=10, default="unknown")
+	// Node.js/Sequelize: status: { type: DataTypes.STRING(10), defaultValue: "unknown" }
+	Status string `gorm:"not null;default:'unknown';size:10" json:"status"`
+
 	// NextCheckAt is when the next HTTP probe is due.
 	// Zero value (time.Time{}) means "due immediately" — new monitors are checked on first tick.
 	// After every check the handler sets: NextCheckAt = NOW() + IntervalSeconds.

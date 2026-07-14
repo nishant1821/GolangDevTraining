@@ -123,8 +123,9 @@ func Scheduler(ctx context.Context, tick time.Duration, due func() []domain.Moni
 					// Only MonitorID and URL are needed by the checker — the pool
 					// doesn't need to know intervals, timeouts, or ownership.
 					job := Job{
-						MonitorID: m.ID,
-						URL:       m.URL,
+						MonitorID:       m.ID,
+						URL:             m.URL,
+						IntervalSeconds: m.IntervalSeconds,
 					}
 
 					// Guard the send with ctx.Done().

@@ -61,8 +61,12 @@ func NewIncidentRepository(db *gorm.DB) IncidentRepository {
 }
 
 // Create inserts a new open incident.
+// Uses txDB(ctx, r.db) so it participates in RunInTx transactions transparently.
+// The incident INSERT and monitor SetStatus UPDATE share the same transaction,
+// so either both commit or both roll back.
 func (r *gormIncidentRepo) Create(ctx context.Context, i *domain.Incident) error {
-	if err := r.db.WithContext(ctx).Create(i).Error; err != nil {
+	db := txDB(ctx, r.db) // transaction-aware: picks tx handle from ctx if present
+	if err := db.WithContext(ctx).Create(i).Error; err != nil {
 		return fmt.Errorf("incident create for monitor %d: %w", i.MonitorID, translateError(err))
 	}
 	return nil
@@ -85,7 +89,8 @@ func (r *gormIncidentRepo) OpenByMonitor(ctx context.Context, monitorID uint) (*
 }
 
 // Resolve sets resolved_at on an incident.
-// We use Updates(map) to update only resolved_at, not the whole struct.
+// Uses txDB(ctx, r.db) so this UPDATE shares a transaction with
+// monitors.SetStatus("up") when called from the DOWN→UP RunInTx block.
 //
 // WHY map[string]any and not Updates(struct)?
 // GORM skips ZERO-VALUE fields when you pass a struct to Updates().
@@ -95,7 +100,8 @@ func (r *gormIncidentRepo) OpenByMonitor(ctx context.Context, monitorID uint) (*
 // Python: session.query(Incident).filter_by(id=id).update({"resolved_at": ts})
 // Node.js: await Incident.update({ resolvedAt: ts }, { where: { id } })
 func (r *gormIncidentRepo) Resolve(ctx context.Context, id uint, resolvedAt time.Time) error {
-	result := r.db.WithContext(ctx).
+	db := txDB(ctx, r.db) // transaction-aware: picks tx handle from ctx if present
+	result := db.WithContext(ctx).
 		Model(&domain.Incident{}).
 		Where("id = ?", id).
 		Updates(map[string]any{"resolved_at": resolvedAt})

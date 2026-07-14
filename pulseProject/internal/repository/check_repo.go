@@ -30,11 +30,12 @@ type CheckRepository interface {
 	// Node.js: await Check.create(data)
 	Save(ctx context.Context, c *domain.Check) error
 
-	// History returns the most recent `limit` checks for a monitor,
-	// ordered newest-first. Used by GET /monitors/:id/history.
+	// History returns a page of checks for a monitor, ordered newest-first.
+	// offset = (page-1)*limit   e.g., page=2, limit=20 → offset=20
 	//
-	// SQL: SELECT * FROM checks WHERE monitor_id=$1 ORDER BY created_at DESC LIMIT $2
-	History(ctx context.Context, monitorID uint, limit int) ([]domain.Check, error)
+	// SQL: SELECT * FROM checks WHERE monitor_id=$1
+	//        ORDER BY created_at DESC LIMIT $2 OFFSET $3
+	History(ctx context.Context, monitorID uint, limit, offset int) ([]domain.Check, error)
 
 	// LatestByMonitor returns the single most recent check for a monitor.
 	// Used to determine current up/down status without loading all history.
@@ -74,12 +75,13 @@ func (r *gormCheckRepo) Save(ctx context.Context, c *domain.Check) error {
 //
 // Python: session.query(Check).filter_by(monitor_id=mid).order_by(Check.created_at.desc()).limit(n).all()
 // Node.js: Check.findAll({ where: { monitorId }, order: [['createdAt','DESC']], limit: n })
-func (r *gormCheckRepo) History(ctx context.Context, monitorID uint, limit int) ([]domain.Check, error) {
+func (r *gormCheckRepo) History(ctx context.Context, monitorID uint, limit, offset int) ([]domain.Check, error) {
 	var checks []domain.Check
 	err := r.db.WithContext(ctx).
 		Where("monitor_id = ?", monitorID).
 		Order("created_at DESC").
 		Limit(limit).
+		Offset(offset).
 		Find(&checks).Error
 	if err != nil {
 		return nil, fmt.Errorf("history for monitor %d: %w", monitorID, translateError(err))

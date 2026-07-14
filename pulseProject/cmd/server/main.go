@@ -1,34 +1,82 @@
 // Package main is the entry point of the Pulse binary.
 //
 // cmd/server/main.go is the "wiring" file — it creates all the pieces
-// (config, DB, services, handlers) and connects them together.
+// (config, DB, repos, services, scheduler, pool) and connects them together.
 // It should contain as LITTLE logic as possible; it just assembles and starts.
 //
-// Think of it like:
+// DEPENDENCY INJECTION BY HAND — what that means:
+//   Go has no DI framework. We create every dependency explicitly and pass it
+//   into the thing that needs it. The order is always:
+//     outermost layer needs → innermost layer first.
 //
-//	Python:  if __name__ == "__main__": uvicorn.run(app, host="0.0.0.0", port=8080)
-//	Node.js: app.listen(PORT, () => console.log(`Pulse running on ${PORT}`))
+//   config  (needs nothing)
+//     ↓
+//   db      (needs config.DatabaseURL)
+//     ↓
+//   repos   (need db)
+//     ↓
+//   service (needs repos)
+//     ↓
+//   checker (needs config.CheckTimeout)
+//     ↓
+//   scheduler+pool (need ctx, service, checker, config)
+//     ↓
+//   http server (needs service — handlers added in Stage 7)
+//
+// Python analogy: if __name__ == "__main__": app = create_app(config)
+// Node.js analogy: const app = buildApp({ config, db, repos, services })
 package main
 
 import (
-	"context"   // context.WithTimeout — gives our shutdown a time limit
-	"fmt"       // fmt.Printf / fmt.Fprintf — print to stdout/stderr (replaced by zerolog in Stage 2)
-	"net/http"  // http.Server, http.StatusOK, http.ErrServerClosed
-	"os"        // os.Signal, os.Stderr, os.Exit
-	"os/signal" // signal.Notify — subscribe to OS signals
-	"syscall"   // syscall.SIGTERM, syscall.SIGINT — OS signal constants
-	"time"      // time.Second — timeout durations
+	"context"           // context.WithCancel, context.WithTimeout
+	"encoding/json"     // json.NewEncoder — health handler response
+	"net/http"          // http.Server, http.ErrServerClosed
+	"os"                // os.Exit, os.Stdout
+	"os/signal"         // signal.Notify
+	"syscall"           // syscall.SIGTERM, syscall.SIGINT
+	"time"              // time.Now, time.Second
 
-	"github.com/go-chi/chi/v5"                  // chi — lightweight HTTP router
-	chiMW "github.com/go-chi/chi/v5/middleware" // chi's built-in middleware
+	"github.com/go-chi/chi/v5"
+	chiMW "github.com/go-chi/chi/v5/middleware"
+	"github.com/rs/zerolog"        // zerolog.New — structured logger
+	"github.com/rs/zerolog/log"    // log.Logger global — used by zerolog internally
+	"gorm.io/gorm"                 // *gorm.DB — health check pings the underlying sql.DB
 
-	// Our own packages — note they are BELOW cmd/ in the dependency tree.
 	"github.com/nishantks908/pulse/config"
-	"github.com/nishantks908/pulse/internal/platform/database" // DB connect + AutoMigrate
+	"github.com/nishantks908/pulse/internal/checker"          // checker.NewHTTPChecker
+	"github.com/nishantks908/pulse/internal/domain"            // domain.Monitor — for due() closure
+	"github.com/nishantks908/pulse/internal/handler"           // handler.AuthHandler, handler.MonitorHandler
+	"github.com/nishantks908/pulse/internal/middleware"        // middleware.RequestID, middleware.Auth, middleware.RateLimit
+	"github.com/nishantks908/pulse/internal/monitor"           // monitor.Scheduler, monitor.RunPool
+	"github.com/nishantks908/pulse/internal/notifier"          // notifier.NewLogNotifier — alert on DOWN
+	"github.com/nishantks908/pulse/internal/platform/cache"   // cache.New — Redis wrapper
+	"github.com/nishantks908/pulse/internal/platform/database"
+	"github.com/nishantks908/pulse/internal/repository"       // repository.New*, repository.NewTransactor
+	"github.com/nishantks908/pulse/internal/service"          // service.NewMonitorService, service.NewUserService
 )
 
 func main() {
-	// ── 1. CONFIG ────────────────────────────────────────────────────────────
+
+	// ── 1. LOGGER ────────────────────────────────────────────────────────────
+	// zerolog.ConsoleWriter formats logs as pretty, colour-coded text in dev.
+	// In production you'd switch to JSON: zerolog.New(os.Stdout).
+	//
+	// zerolog.New returns a zerolog.Logger (value type, copy-safe).
+	// .With().Timestamp().Logger() adds the "time" field to every log line.
+	//
+	// Python: logging.basicConfig(format="%(asctime)s %(levelname)s %(message)s")
+	// Node.js: const log = pino({ transport: { target: 'pino-pretty' } })
+	logger := zerolog.New(zerolog.ConsoleWriter{Out: os.Stdout}).
+		With().Timestamp().Logger()
+
+	// Set the global zerolog logger so zerolog/log.* calls work anywhere.
+	// We still pass `logger` explicitly to middleware — globals are fine for
+	// process-level init but explicit injection is better for libraries.
+	log.Logger = logger
+
+	logger.Info().Msg("Pulse starting…")
+
+	// ── 2. CONFIG ────────────────────────────────────────────────────────────
 	// Read ALL configuration from environment variables at startup.
 	// We call Load() ONCE here and pass cfg down to everything that needs it.
 	// "One call, many uses" — we never call config.Load() inside a handler.
@@ -37,217 +85,355 @@ func main() {
 	// Node.js: const config = require('./config')
 	cfg := config.Load()
 
-	// ── 2. DATABASE ──────────────────────────────────────────────────────────
+	// ── 3. DATABASE ──────────────────────────────────────────────────────────
 	// Connect to Postgres and run AutoMigrate to sync the schema.
 	// We crash fast on failure — no DB means the whole service is broken.
 	//
-	// Python: engine = create_engine(cfg.database_url); Base.metadata.create_all(engine)
+	// Python: engine = create_engine(url); Base.metadata.create_all(engine)
 	// Node.js: await sequelize.authenticate(); await sequelize.sync({ alter: true })
 	db, err := database.Connect(cfg.DatabaseURL)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "db connect: %v\n", err)
-		os.Exit(1)
+		logger.Fatal().Err(err).Msg("db connect failed")
 	}
 	if err := database.AutoMigrate(db); err != nil {
-		fmt.Fprintf(os.Stderr, "db migrate: %v\n", err)
-		os.Exit(1)
+		logger.Fatal().Err(err).Msg("db migrate failed")
 	}
-	fmt.Println("✅ Database connected and migrated")
-	// db is passed to repositories in later stages — keep it in scope.
-	_ = db
+	logger.Info().Msg("database connected and migrated")
 
-	// ── 4. ROUTER ────────────────────────────────────────────────────────────
-	// chi.NewRouter() creates a new HTTP mux (multiplexer).
-	// It routes incoming HTTP requests to the right handler function.
+	// ── 3. REDIS CACHE ───────────────────────────────────────────────────────
+	// Redis is optional — if it's unreachable, we log a warning and run
+	// without caching (DB-only). Service and rate-limiter handle nil gracefully.
 	//
-	// Python/FastAPI:   app = FastAPI()
-	// Python/Flask:     app = Flask(__name__)
-	// Node.js/Express:  const app = express()
-	r := chi.NewRouter()
-
-	// ── 5. MIDDLEWARE ────────────────────────────────────────────────────────
-	// r.Use() registers middleware that runs for EVERY request.
-	// Middleware forms a chain: Request → MW1 → MW2 → Handler → MW2 → MW1 → Response
-	// (each middleware can run code both before AND after the handler)
+	// Graceful degradation rule:
+	//   DB down   → Fatal (can't serve any data without DB)
+	//   Redis down → Warn  (cache miss every time, but service still works)
 	//
-	// Python: app.add_middleware(SomeMiddleware)
-	// Node.js: app.use(someMiddleware)
-
-	// Logger: prints one line per request: "GET /health HTTP/1.1 200 1.2ms"
-	// Very useful during development; in production we'll replace with zerolog.
-	r.Use(chiMW.Logger)
-
-	// Recoverer: if any handler panics (e.g., nil pointer dereference),
-	// Recoverer catches the panic, logs the stack trace, and returns HTTP 500.
-	// Without Recoverer, a single panic crashes the ENTIRE process.
-	//
-	// GOTCHA: in Go, a panic in a goroutine kills that goroutine. If the goroutine
-	// is your HTTP handler, the whole server process terminates. Always recover!
-	//
-	// Python: Flask/Django/FastAPI catch panics (exceptions) automatically.
-	// Node.js: uncaughtException or express-async-errors handles this.
-	r.Use(chiMW.Recoverer)
-
-	// ── 6. ROUTES ────────────────────────────────────────────────────────────
-	// r.Get(path, handlerFunc) maps GET requests to a function.
-	//
-	// Handler signature in Go is ALWAYS:
-	//   func(w http.ResponseWriter, r *http.Request)
-	//   w = write INTO this (set headers, status code, body)
-	//   r = read FROM this (URL params, headers, body)
-	//
-	// Python/FastAPI: @app.get("/health")
-	// Node.js/Express: app.get('/health', (req, res) => { ... })
-
-	// /health is the liveness probe — Kubernetes pings this to check if the
-	// pod is alive. Return 200 if the server is running.
-	r.Get("/health", healthHandler)
-
-	// More routes will be added in later stages:
-	// r.Post("/auth/register", authHandler.Register)
-	// r.Post("/auth/login",    authHandler.Login)
-	// r.Route("/monitors", func(r chi.Router) { ... })
-
-	// ── 7. HTTP SERVER ───────────────────────────────────────────────────────
-	// We create *http.Server explicitly (instead of http.ListenAndServe())
-	// because only an explicit *http.Server gives us the Shutdown() method
-	// for graceful termination.
-	//
-	// Python: uvicorn manages the server lifecycle; you rarely do this manually.
-	// Node.js: const server = http.createServer(app) then server.close()
-	srv := &http.Server{
-		Addr:    ":" + cfg.Port, // ":8080" — all network interfaces, port 8080
-		Handler: r,              // our chi router handles every request
-
-		// Timeouts defend against slow/malicious clients (e.g., Slowloris attack).
-		// Without timeouts, a client that trickles headers one byte per second
-		// can hold open a goroutine indefinitely, exhausting your server.
-		ReadTimeout:  10 * time.Second, // max time to read headers + body
-		WriteTimeout: 10 * time.Second, // max time to send the full response
-		IdleTimeout:  60 * time.Second, // max time a keep-alive connection may sit idle
+	// Python: cache = redis.from_url(url) if REDIS_URL else None
+	// Node.js: const cache = REDIS_URL ? new Redis(REDIS_URL) : null
+	var cacheClient *cache.Cache
+	if c, err := cache.New(cfg.RedisURL); err != nil {
+		logger.Warn().Err(err).Msg("redis unavailable — running without cache")
+	} else {
+		cacheClient = c
+		logger.Info().Str("url", cfg.RedisURL).Msg("redis connected")
 	}
 
-	// ── 8. START SERVER (non-blocking) ───────────────────────────────────────
-	// We start the server in a goroutine so main() can continue to the
-	// signal-listening code below.
+	// ── 4. REPOSITORIES ──────────────────────────────────────────────────────
+	monitorRepo  := repository.NewMonitorRepository(db)
+	checkRepo    := repository.NewCheckRepository(db)
+	incidentRepo := repository.NewIncidentRepository(db)
+
+	// ── 4b. TRANSACTOR ───────────────────────────────────────────────────────
+	// Transactor wraps db.Transaction so the service can run multiple repo
+	// writes atomically WITHOUT importing *gorm.DB.
 	//
-	// If we called srv.ListenAndServe() directly here (without "go"),
-	// main() would block at that line and NEVER reach the shutdown logic.
+	// Stage 9: used by RecordOutcome to wrap (incident CREATE + status UPDATE)
+	// in one atomic boundary — either both commit or both roll back.
 	//
-	// "go func() { ... }()" is an immediately-invoked goroutine.
-	// goroutine = lightweight cooperative thread managed by the Go runtime.
+	// Python: session.begin() context manager
+	// Node.js: knex.transaction(async trx => { ... })
+	txr := repository.NewTransactor(db)
+
+	// ── 4c. NOTIFIER ─────────────────────────────────────────────────────────
+	// Notifier is called AFTER the incident transaction commits (Stage 9).
+	// LogNotifier writes a structured zerolog error line — swap for
+	// EmailNotifier/SlackNotifier in production without touching service code.
 	//
-	// Python/asyncio:   asyncio.create_task(server.serve())
-	// Node.js:          app.listen() is non-blocking by default
+	// Python: alerter = LogNotifier(logger)
+	// Node.js: const alerter = new LogNotifier(logger)
+	alerter := notifier.NewLogNotifier(logger)
+
+	// ── 5. MONITOR SERVICE ───────────────────────────────────────────────────
+	// cacheClient is passed in — nil means "no caching".
+	// service.NewMonitorService guards every cache call with `if s.cache != nil`.
 	//
-	// GOTCHA: If the server fails to start (e.g., port already in use),
-	// the error happens INSIDE this goroutine, not in main(). We must handle
-	// it inside the goroutine — it won't bubble up to the caller automatically.
+	// Stage 9 additions: txr (Transactor) and alerter (Notifier) are injected.
+	//
+	// Python: svc = MonitorService(repos..., cache=cache_client, tx=txr, notifier=alerter)
+	// Node.js: const svc = new MonitorService(repos, cacheClient, txr, alerter)
+	svc := service.NewMonitorService(monitorRepo, checkRepo, incidentRepo, cacheClient, txr, alerter, logger)
+
+	// ── 4b. USER SERVICE ─────────────────────────────────────────────────────
+	// UserService handles registration + login.
+	// It needs:
+	//   - UserRepository  (interface — DB access)
+	//   - jwtSecret       ([]byte — HMAC signing key from config)
+	//   - jwtTTL          (how long tokens are valid, from config)
+	//
+	// Python:
+	//   user_svc = UserService(user_repo, jwt_secret, jwt_expiry)
+	// Node.js:
+	//   const userSvc = new UserService(userRepo, jwtSecret, jwtExpiry)
+	userRepo := repository.NewUserRepository(db)
+	userSvc := service.NewUserService(userRepo, []byte(cfg.JWTSecret), cfg.JWTExpiry)
+
+	// ── 5. HTTP CHECKER ──────────────────────────────────────────────────────
+	// The checker performs actual HTTP probes.
+	// cfg.CheckTimeout is the per-request deadline (e.g. 10 seconds).
+	// We pass it here so the service never has to deal with timeouts directly.
+	//
+	// Python: checker = HttpChecker(timeout=cfg.check_timeout)
+	// Node.js: const checker = new HttpChecker({ timeout: cfg.checkTimeout })
+	httpChecker := checker.NewHTTPChecker(cfg.CheckTimeout)
+
+	// ── 6. PIPELINE CONTEXT ───────────────────────────────────────────────────
+	// The pipeline (Scheduler + Pool) needs its OWN context, separate from the
+	// HTTP server shutdown context.
+	//
+	// WHY separate?
+	//   - HTTP server shutdown context has a 10-second deadline.
+	//   - We cancel the pipeline on SIGTERM (before the deadline) so in-flight
+	//     checks can finish cleanly BEFORE we stop the HTTP server.
+	//   - If we shared one context, pipeline and HTTP server would race.
+	//
+	// Python: pipeline_task = asyncio.create_task(run_pipeline(...))
+	// Node.js: const pipelineAbort = new AbortController()
+	pipelineCtx, pipelineCancel := context.WithCancel(context.Background())
+	// defer ensures pipeline stops even if main() returns unexpectedly early.
+	defer pipelineCancel()
+
+	// ── 7. SCHEDULER + POOL ───────────────────────────────────────────────────
+	// Wire the full Scheduler → Pool pipeline.
+	//
+	// `due` is a closure that the Scheduler calls on every tick.
+	// In production it hits the DB. This closure is the ONLY place that
+	// connects the Scheduler (monitor package) to the DB (repository package).
+	//
+	// Note: we pass context.Background() to ListDue, not pipelineCtx —
+	// the DB query should complete even when we're shutting down, so we get
+	// results for any tick that already fired.
+	due := func() []domain.Monitor {
+		monitors, err := monitorRepo.ListDue(context.Background(), time.Now())
+		if err != nil {
+			// Structured log replaces fmt.Fprintf(os.Stderr, ...).
+			// zerolog writes JSON in production; ConsoleWriter formats it for dev.
+			// The "error" field is queryable in log aggregators (Datadog, Loki).
+			logger.Error().Err(err).Msg("scheduler: list due monitors failed")
+			return nil
+		}
+		return monitors
+	}
+
+	// Scheduler ticks every cfg.ScheduleInterval, calls due(), pushes Jobs.
+	// Returns a jobs channel that is closed when pipelineCtx is cancelled.
+	jobs := monitor.Scheduler(pipelineCtx, cfg.ScheduleInterval, due)
+
+	// RunPool starts cfg.WorkerCount goroutines that consume jobs, call
+	// httpChecker.Check(), and emit Outcomes.
+	// Returns an outcomes channel closed when all workers finish.
+	outcomes := monitor.RunPool(pipelineCtx, httpChecker, cfg.WorkerCount, jobs)
+
+	// ── 8. OUTCOME RECORDING GOROUTINE ───────────────────────────────────────
+	// A single goroutine drains the outcomes channel.
+	// For each Outcome it calls svc.RecordOutcome which:
+	//   1. Saves the Check row to DB.
+	//   2. Updates monitor.NextCheckAt.
+	//   3. Opens or resolves an Incident.
+	//
+	// This goroutine exits automatically when outcomes is closed
+	// (which happens after all workers finish, triggered by pipelineCancel).
+	//
+	// Python:
+	//   async for outcome in outcomes_queue:
+	//       await svc.record_outcome(outcome)
+	// Node.js:
+	//   for await (const outcome of outcomesStream) {
+	//       await svc.recordOutcome(outcome)
+	//   }
 	go func() {
-		fmt.Printf("🚀 Pulse listening on :%s\n", cfg.Port)
+		for o := range outcomes {
+			if err := svc.RecordOutcome(context.Background(), o); err != nil {
+				logger.Error().Err(err).Msg("record outcome failed")
+			}
+		}
+		logger.Info().Msg("outcome recorder stopped")
+	}()
 
-		// ListenAndServe blocks until the server is stopped.
-		// srv.Shutdown() causes it to return http.ErrServerClosed — that is
-		// NOT a real error, it just means "shutdown was requested". We check
-		// for it explicitly so we don't log a false alarm.
+	logger.Info().
+		Str("interval", cfg.ScheduleInterval.String()).
+		Int("workers", cfg.WorkerCount).
+		Msg("pipeline started")
+
+	// ── 9. HANDLERS ──────────────────────────────────────────────────────────
+	authH    := handler.NewAuthHandler(userSvc)
+	monitorH := handler.NewMonitorHandler(svc)
+
+	// ── 10. ROUTER + MIDDLEWARE ───────────────────────────────────────────────
+	// Middleware ordering (outermost → innermost on the way IN):
+	//
+	//   RequestID  → generates UUID, stores in ctx, sets X-Request-ID header
+	//   Logger     → reads UUID from ctx, logs after handler returns (LIFO)
+	//   Recoverer  → catches panics from handlers, returns 500 instead of crash
+	//
+	// On the way OUT the order reverses (LIFO stack):
+	//   Recoverer → Logger (captures status + latency) → RequestID
+	//
+	// WHY RequestID must be BEFORE Logger?
+	//   Logger.NewLogger calls RequestIDFromCtx() to include the ID in the log line.
+	//   If RequestID runs after Logger, the context doesn't have the UUID yet —
+	//   the log line would show an empty request_id.
+	//
+	// Python/FastAPI:
+	//   app.add_middleware(RequestIDMiddleware)   ← outermost (added last, runs first)
+	//   app.add_middleware(LoggingMiddleware)
+	// Node.js/Express:
+	//   app.use(requestIdMiddleware)  ← first app.use = first to run
+	//   app.use(loggerMiddleware)
+	r := chi.NewRouter()
+	r.Use(middleware.RequestID)               // 1st: generate UUID → context + header
+	r.Use(middleware.NewLogger(logger))        // 2nd: structured request log (reads UUID)
+	r.Use(chiMW.Recoverer)                     // 3rd: panic → 500, never crash
+
+	// ── 11. ROUTES ────────────────────────────────────────────────────────────
+	//
+	// All routes live under /api so versioning is easy later (/api/v2/...).
+	//
+	// Public (no JWT):
+	//   GET  /health
+	//   POST /api/auth/register
+	//   POST /api/auth/login
+	//
+	// Protected (JWT in Authorization: Bearer header):
+	//   POST   /api/monitors
+	//   GET    /api/monitors
+	//   GET    /api/monitors/{id}
+	//   PATCH  /api/monitors/{id}/pause
+	//   PATCH  /api/monitors/{id}/resume
+	//   DELETE /api/monitors/{id}
+	//   GET    /api/monitors/{id}/checks   ← paginated probe history
+
+	r.Get("/health", newHealthHandler(db, cacheClient))
+
+	r.Route("/api", func(r chi.Router) {
+		// Rate limiting: 200 req/min per IP across all /api routes.
+		// Applies BEFORE auth — even unauthenticated bursts (e.g., brute-force
+		// on /auth/login) are throttled.
+		//
+		// cacheClient nil → RateLimit fails-open (no limiting, but no crash).
+		r.Use(middleware.RateLimit(cacheClient, 200, time.Minute))
+
+		r.Post("/auth/register", authH.Register)
+		r.Post("/auth/login", authH.Login)
+
+		r.Route("/monitors", func(r chi.Router) {
+			r.Use(middleware.Auth([]byte(cfg.JWTSecret)))
+			r.Post("/", monitorH.Create)
+			r.Get("/", monitorH.List)
+			r.Get("/{id}", monitorH.Get)
+			r.Patch("/{id}/pause", monitorH.Pause)
+			r.Patch("/{id}/resume", monitorH.Resume)
+			r.Delete("/{id}", monitorH.Delete)
+			r.Get("/{id}/checks", monitorH.Checks)
+		})
+	})
+
+	// ── 11. HTTP SERVER ───────────────────────────────────────────────────────
+	srv := &http.Server{
+		Addr:         ":" + cfg.Port,
+		Handler:      r,
+		ReadTimeout:  10 * time.Second,
+		WriteTimeout: 10 * time.Second,
+		IdleTimeout:  60 * time.Second,
+	}
+
+	go func() {
+		logger.Info().Str("addr", ":"+cfg.Port).Msg("HTTP server listening")
 		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-			// Real failure: e.g., "bind: address already in use"
-			fmt.Fprintf(os.Stderr, "server failed to start: %v\n", err)
-			os.Exit(1) // crash fast on startup failure — retrying makes no sense
+			logger.Fatal().Err(err).Msg("server failed to start")
 		}
 	}()
 
-	// ── 9. WAIT FOR SHUTDOWN SIGNAL ──────────────────────────────────────────
-	// The server is running in the goroutine above.
-	// Now main() waits here until the OS sends SIGTERM or SIGINT.
-	//
-	// SIGTERM: sent by Kubernetes / systemd when they want to stop the process.
-	// SIGINT:  sent when you press Ctrl+C in the terminal.
-	//
-	// Python: signal.signal(signal.SIGTERM, lambda s, f: shutdown())
-	// Node.js: process.on('SIGTERM', () => server.close(() => process.exit(0)))
-
-	// make(chan os.Signal, 1) creates a BUFFERED channel with capacity 1.
-	// Why buffered? If the OS delivers the signal before main() reaches <-quit,
-	// an unbuffered channel would cause the signal to be dropped (missed!).
-	// A buffer of 1 holds the signal safely until we're ready to receive it.
+	// ── 12. WAIT FOR SHUTDOWN SIGNAL ─────────────────────────────────────────
 	quit := make(chan os.Signal, 1)
-
-	// Tell the Go runtime: "when you receive SIGTERM or SIGINT, send it to 'quit'."
 	signal.Notify(quit, syscall.SIGTERM, syscall.SIGINT)
+	<-quit // BLOCKS here until SIGTERM or Ctrl+C
 
-	// <-quit BLOCKS main() here — it sleeps until a signal arrives.
-	// This is idiomatic Go for "wait forever until told to stop".
-	<-quit
+	logger.Info().Msg("shutdown signal received")
 
-	fmt.Println("\n⏳ Shutting down (max 10s)…")
+	// ── 13. GRACEFUL SHUTDOWN ─────────────────────────────────────────────────
+	pipelineCancel()
+	logger.Info().Msg("pipeline cancelled")
 
-	// ── 10. GRACEFUL SHUTDOWN ─────────────────────────────────────────────────
-	// context.WithTimeout creates a Context that auto-cancels after 10 seconds.
-	// We pass this to Shutdown(), which means:
-	//   - Stop accepting NEW connections immediately.
-	//   - Wait up to 10 seconds for IN-FLIGHT requests to finish.
-	//   - If 10 seconds pass and some requests are still running, force-close.
-	//
-	// context.Background() is the root context — no deadline, no cancel, just a root.
-	// We derive a child context with a deadline using WithTimeout.
-	//
-	// defer cancel() ensures context resources are freed when main() returns,
-	// even if shutdown finishes in 1 second (defer runs at function exit).
-	// This pattern is idiomatic Go — like Python's "with" or Node's "finally".
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	shutCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
-	// srv.Shutdown(ctx) is the graceful stop:
-	//   1. Closes the listener (no new connections).
-	//   2. Waits for active connections to become idle (or ctx to expire).
-	//   3. Returns nil on clean shutdown, ctx.Err() if timed out.
-	if err := srv.Shutdown(ctx); err != nil {
-		// Timed out — some connections were force-closed.
-		fmt.Fprintf(os.Stderr, "⚠️  shutdown timed out: %v\n", err)
+	if err := srv.Shutdown(shutCtx); err != nil {
+		logger.Error().Err(err).Msg("shutdown timed out")
 	} else {
-		fmt.Println("✅ Pulse stopped cleanly.")
+		logger.Info().Msg("Pulse stopped cleanly")
 	}
-	// main() returns → the process exits with code 0.
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// healthHandler
-// ─────────────────────────────────────────────────────────────────────────────
-
-// healthHandler responds to GET /health with a simple JSON payload.
+// newHealthHandler returns an http.HandlerFunc that pings Postgres and Redis
+// and reports their status. Used by load balancers and k8s liveness probes.
 //
-// Separating it from main() as a named function makes unit testing easy:
+// Response 200 — both dependencies reachable:
+//   {"status":"ok","postgres":"ok","redis":"ok"}
 //
-//	w := httptest.NewRecorder()
-//	r := httptest.NewRequest(http.MethodGet, "/health", nil)
-//	healthHandler(w, r)
-//	assert.Equal(t, 200, w.Code)
+// Response 503 — one or more dependencies down:
+//   {"status":"degraded","postgres":"ok","redis":"down"}
 //
-// Python/FastAPI:   async def health() -> dict: return {"status": "ok"}
-// Node.js/Express:  app.get('/health', (req, res) => res.json({ status: 'ok' }))
-func healthHandler(w http.ResponseWriter, r *http.Request) {
-	// Set the Content-Type header BEFORE calling WriteHeader.
-	//
-	// GOTCHA: Once WriteHeader() is called, headers are flushed to the client
-	// and CANNOT be modified. Always set headers first.
-	//
-	// In Express:  res.json() sets Content-Type automatically.
-	// In FastAPI:  JSONResponse sets it automatically.
-	// In Go:       you set it manually — more control, more responsibility.
-	w.Header().Set("Content-Type", "application/json")
+// WHY 503 (not 200 with an error field)?
+//   Load balancers and orchestrators (k8s, ECS) look at the HTTP status code
+//   to decide whether to route traffic to this instance.
+//   A 503 tells them "take this pod out of rotation — it can't serve requests."
+//   A 200 with {"status":"degraded"} would be silently ignored.
+//
+// Redis nil (not configured) → reported as "disabled", does NOT trigger 503.
+//   Service degrades gracefully when Redis is unavailable (Stage 8 policy).
+//
+// Python/Flask: @app.route("/health") def health(): return jsonify(checks), 503 if bad
+// Node.js/Express: app.get("/health", (req, res) => res.status(ok ? 200 : 503).json(checks))
+func newHealthHandler(db *gorm.DB, c *cache.Cache) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		// 3-second deadline — health checks must be fast.
+		// A slow health check causes false negatives under load.
+		ctx, cancel := context.WithTimeout(r.Context(), 3*time.Second)
+		defer cancel()
 
-	// Send the HTTP status line: "HTTP/1.1 200 OK"
-	// http.StatusOK is the constant 200 — prefer named constants over magic numbers.
-	w.WriteHeader(http.StatusOK)
+		type response struct {
+			Status   string `json:"status"`
+			Postgres string `json:"postgres"`
+			Redis    string `json:"redis"`
+		}
 
-	// Write the response body as raw bytes.
-	// []byte("...") converts the string literal to a byte slice —
-	// http.ResponseWriter.Write requires []byte, not string.
-	//
-	// We don't check the error from Write here. If the client closed the
-	// connection, there's nothing we can do about it. This is one of the rare
-	// "intentionally ignored error" cases in Go. The //nolint comment silences
-	// linters that would otherwise flag the ignored return value.
-	w.Write([]byte(`{"status":"ok","service":"pulse"}`)) //nolint:errcheck
+		res := response{}
+		code := http.StatusOK
+
+		// ── Check Postgres ────────────────────────────────────────────────────
+		// db.DB() returns the underlying *sql.DB from the standard library.
+		// PingContext sends a cheap round-trip to verify the connection is alive.
+		//
+		// Python: engine.connect().execute("SELECT 1")
+		// Node.js: await pool.query("SELECT 1")
+		sqlDB, err := db.DB()
+		if err != nil || sqlDB.PingContext(ctx) != nil {
+			res.Postgres = "down"
+			code = http.StatusServiceUnavailable // 503
+		} else {
+			res.Postgres = "ok"
+		}
+
+		// ── Check Redis ───────────────────────────────────────────────────────
+		// c == nil means Redis was not configured at startup (graceful degrade).
+		// "disabled" ≠ "down" — don't penalise a deliberately optional dependency.
+		if c == nil {
+			res.Redis = "disabled"
+		} else if err := c.Ping(ctx); err != nil {
+			res.Redis = "down"
+			code = http.StatusServiceUnavailable
+		} else {
+			res.Redis = "ok"
+		}
+
+		if code == http.StatusOK {
+			res.Status = "ok"
+		} else {
+			res.Status = "degraded"
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(code)
+		json.NewEncoder(w).Encode(res) //nolint:errcheck
+	}
 }
