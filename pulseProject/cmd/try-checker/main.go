@@ -54,7 +54,7 @@ func main() {
 	ctx, cancel := context.WithTimeout(context.Background(), 4*time.Second)
 	defer cancel() // will run when main() returns
 
-	fmt.Println("Pulse Checker — probing URLs...\n")
+	fmt.Println("Pulse Checker — probing URLs...")
 
 	for _, url := range urls {
 		// c.Check() blocks until the response arrives or context/timeout fires.

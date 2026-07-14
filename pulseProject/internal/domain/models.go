@@ -79,6 +79,15 @@ type Monitor struct {
 	// Useful for pausing a monitor without deleting it.
 	Active bool `gorm:"not null;default:true" json:"active"`
 
+	// NextCheckAt is when the next HTTP probe is due.
+	// Zero value (time.Time{}) means "due immediately" — new monitors are checked on first tick.
+	// After every check the handler sets: NextCheckAt = NOW() + IntervalSeconds.
+	// ListDue queries: WHERE active=true AND next_check_at <= NOW()
+	//
+	// Python/Django: next_check_at = models.DateTimeField(default=datetime.min)
+	// Node.js/Sequelize: nextCheckAt: { type: DataTypes.DATE, defaultValue: new Date(0) }
+	NextCheckAt time.Time `gorm:"not null;default:'0001-01-01'" json:"next_check_at"`
+
 	// ── Relationships ────────────────────────────────────────────────────────
 	//
 	// GORM can auto-populate these when you call db.Preload("User") or

@@ -1197,8 +1197,312 @@ T+0ms  Caller (main.go / test):
 
 ### What's next — Stage 5
 
-Result Handler aur Repository:
-- `internal/repository/` — Monitor aur Check ke liye DB access (GORM)
-- `internal/monitor/handler.go` — outcomes channel drain karta hai, Check DB mein save karta hai, Incident open/close karta hai
-- `internal/platform/` — PostgreSQL connection bootstrap
-- `main.go` mein poora pipeline wire karna: Scheduler + Pool + Handler
+Persistence — GORM + Repository pattern:
+- `internal/platform/database/` — PostgreSQL connect + connection pool + AutoMigrate
+- `internal/repository/` — MonitorRepository, CheckRepository, UserRepository, IncidentRepository interfaces + GORM implementations
+- Error translation: `gorm.ErrRecordNotFound` → `domain.ErrNotFound`
+
+---
+
+## Stage 5 — Persistence (GORM + Repository Pattern)
+
+### What we built
+
+| File | Purpose |
+|---|---|
+| `internal/platform/database/database.go` | `Connect()` — opens Postgres, tunes pool; `AutoMigrate()` — syncs schema |
+| `internal/repository/errors.go` | `translateError()` — converts GORM errors to domain errors |
+| `internal/repository/monitor_repo.go` | `MonitorRepository` interface + GORM impl (Create, ByID, ListDue, ListByUser, UpdateStatus, UpdateNextCheck, Delete) |
+| `internal/repository/check_repo.go` | `CheckRepository` interface + GORM impl (Save, History, LatestByMonitor) |
+| `internal/repository/user_repo.go` | `UserRepository` interface + GORM impl (Create, ByID, ByEmail) |
+| `internal/repository/incident_repo.go` | `IncidentRepository` interface + GORM impl (Create, OpenByMonitor, Resolve, ListByMonitor) |
+| `domain/models.go` (updated) | Added `NextCheckAt time.Time` to Monitor — needed by ListDue |
+| `cmd/server/main.go` (updated) | Step 2: `database.Connect` + `database.AutoMigrate` at startup |
+
+---
+
+### The Repository Pattern — Ek Simple Analogy
+
+Socho ek **librarian (library wala)** hai.
+
+- **Service (caller)** = student. "Mujhe 'Clean Code' book chahiye."
+- **LibraryRepository (interface)** = reception counter. Counter ka koi bhi method call karo — tumhe nahi pata andar kya ho raha hai.
+- **GormLibraryRepository (implementation)** = actual andar ka banda jo shelves pe jaata hai aur GORM se Postgres mein dhundhta hai.
+- **FakeLibraryRepository (test double)** = test mein ek banda jo seedha "yeh lo book" bol deta hai — shelves nahi, Postgres nahi.
+
+```
+Student (service)
+  ↓ calls interface method
+Reception Counter (LibraryRepository interface)  ← boundary
+  ↓ implemented by
+GormLibraryRepository  OR  FakeLibraryRepository
+```
+
+**Interface ke bina:**
+```go
+// service seedha *gorm.DB use karta hai
+func (s *Service) GetMonitor(id uint) (*domain.Monitor, error) {
+    var m domain.Monitor
+    s.db.First(&m, id)  // ← gorm seedha service mein
+    return &m, nil
+}
+// Test mein: real Postgres chahiye. Slow. Flaky. CI mein pain.
+```
+
+**Interface ke saath:**
+```go
+// service sirf interface jaanta hai
+func (s *Service) GetMonitor(ctx context.Context, id uint) (*domain.Monitor, error) {
+    return s.monitors.ByID(ctx, id)  // ← interface call, gorm ka pata nahi
+}
+// Test mein: fakeMonitorRepo inject karo → hardcoded data → no DB needed ✅
+```
+
+---
+
+### Concept 1 — GORM ka `WithContext`
+
+```go
+r.db.WithContext(ctx).First(&m, id)
+```
+
+**Har GORM query ke saath `WithContext(ctx)` lagao — hamesha.**
+
+```
+Bina WithContext:
+  DB query shuru hui
+  Request timeout ho gayi (client chala gaya)
+  Query ABHI BHI chal rahi hai Postgres mein
+  Wasted CPU, wasted DB connection
+
+WithContext ke saath:
+  ctx cancel → GORM immediately query abort karta hai
+  DB connection pool mein wapas jaata hai
+  Resources free ✅
+```
+
+```
+Python/SQLAlchemy: session.execute(stmt, execution_options={"timeout": 5})
+Node.js/Sequelize: Model.findOne({ transaction, lock: true })  — no direct ctx equiv
+Go/GORM:          db.WithContext(ctx).First(...)  — idiomatic, always use it
+```
+
+---
+
+### Concept 2 — Error Translation
+
+```go
+// errors.go
+func translateError(err error) error {
+    if errors.Is(err, gorm.ErrRecordNotFound) {
+        return domain.ErrNotFound
+    }
+    return err
+}
+```
+
+**Kyun translate karna zaroori hai?**
+
+```
+Bina translation:
+  Repository returns: gorm.ErrRecordNotFound
+  Service ko import karna padega: "gorm.io/gorm"
+  Handler ko bhi pata hoga GORM ka naam
+  Kal GORM replace karoge → service + handler DONO todna padega
+
+Translation ke saath:
+  Repository returns: domain.ErrNotFound  (apna error)
+  Service checks:     errors.Is(err, domain.ErrNotFound)
+  Handler returns:    HTTP 404
+  Kal GORM replace karo → sirf repository todna padega ✅
+```
+
+```
+Python: SQLAlchemy NoResultFound → service catches AppNotFoundError
+Node.js: Sequelize EmptyResultError → service catches NotFoundError
+Go: gorm.ErrRecordNotFound → repository translates → domain.ErrNotFound
+```
+
+**Aur yeh kyun `errors.Is()` use karta hai `==` nahi?**
+```go
+// GORM error wrap karke return karta hai agar chain mein ho:
+err = fmt.Errorf("First: %w", gorm.ErrRecordNotFound)
+
+errors.Is(err, gorm.ErrRecordNotFound)  // ✅ true — chain mein dhundhta hai
+err == gorm.ErrRecordNotFound           // ❌ false — direct compare, wrap miss
+```
+
+---
+
+### Concept 3 — AutoMigrate
+
+```go
+db.AutoMigrate(
+    &domain.User{},
+    &domain.Monitor{},
+    &domain.Check{},
+    &domain.Incident{},
+)
+```
+
+GORM domain structs ke field + tags ko read karta hai aur Postgres schema se compare karta hai.
+
+```
+Agar table nahi hai    → CREATE TABLE ... banata hai
+Agar column nahi hai   → ALTER TABLE ... ADD COLUMN banata hai
+Agar column hai already → kuch nahi karta (safe)
+Agar column HATAYA struct se → GORM kuch nahi karta (column raha rahega)
+```
+
+**AutoMigrate kabhi column drop nahi karta** — production DB mein data safe.
+
+```
+Python/Alembic:    alembic upgrade head   ← SQL migration files generate karta hai
+Python/GORM:       Base.metadata.create_all(engine)  ← auto, no migration files
+Node.js/Sequelize: sequelize.sync({ alter: true })   ← same as GORM AutoMigrate
+Go/GORM:           db.AutoMigrate(...)               ← development ke liye perfect
+```
+
+---
+
+### Concept 4 — Connection Pool
+
+```go
+sqlDB.SetMaxOpenConns(25)        // max DB connections
+sqlDB.SetMaxIdleConns(10)        // idle connections (pre-warmed)
+sqlDB.SetConnMaxLifetime(5 * time.Minute)  // max age
+```
+
+**Bina pool tuning ke kya hoga?**
+
+```
+Default: unlimited connections
+1000 concurrent requests aaye → 1000 DB connections open
+Postgres ka default limit: 100 connections
+Postgres crash → "too many connections" error ❌
+```
+
+**Pool ke saath:**
+```
+Max 25 connections → request 26 wait karta hai queue mein
+Postgres comfortable → no crash ✅
+```
+
+```
+ConnMaxLifetime kyun? 
+  Ek connection 2 ghante old hai
+  Postgres restart hua bich mein
+  Old connection broken hai — GORM ko pata nahi
+  Next query fail hogi
+  5 minute max age → GORM automatically new connection banata hai ✅
+```
+
+---
+
+### Concept 5 — `RowsAffected` check UPDATE mein
+
+```go
+result := r.db.WithContext(ctx).
+    Model(&domain.Monitor{}).
+    Where("id = ?", id).
+    Updates(map[string]any{"active": active})
+
+if result.RowsAffected == 0 {
+    return domain.ErrNotFound  // monitor exists hi nahi
+}
+```
+
+**Kyun?**
+```
+SELECT First() → row nahi mila → GORM returns gorm.ErrRecordNotFound ✅
+UPDATE         → row nahi mila → GORM returns nil error, RowsAffected = 0 ❌
+
+UPDATE pe GORM error nahi deta — tumhe khud RowsAffected check karna padta hai.
+```
+
+---
+
+### Concept 6 — `Updates(map)` vs `Save(struct)`
+
+```go
+// ✅ SAHI — sirf active field update hoga
+r.db.Updates(map[string]any{"active": false})
+
+// ❌ GALAT — POORA struct save hoga, zero values bhi
+r.db.Save(&monitor)  // NextCheckAt = time.Time{} → DB mein overwrite ❌
+```
+
+```
+GORM Save():    "write karo SAB fields — zero values bhi"
+GORM Updates(): "write karo sirf WOH fields jo map mein hain"
+
+Rule: partial update karna hai toh hamesha Updates(map) use karo.
+```
+
+---
+
+### Where does the interface "live"?
+
+**Question se seedha:**
+> "Why define repository as interface? Where does interface live and why?"
+
+**Short answer:** Interface consumer ke paas hona chahiye (service layer), implementation producer ke paas (repository layer).
+
+```
+Ideal Go pattern:
+  service/interfaces.go → MonitorRepository interface define karta hai
+  repository/monitor_repo.go → interface satisfy karta hai
+
+Humara Stage 5:
+  repository/monitor_repo.go mein dono hain (interface + impl)
+  Reason: service layer abhi bana nahi (Stage 6 mein banega)
+  Stage 6 mein interface move hoga service/ mein
+```
+
+**Kyun interface service mein hona chahiye?**
+```
+Service sirf woh methods define kare jo USE karta hai.
+Agar repository mein 10 methods hain lekin service sirf 3 use karta hai,
+service ke interface mein sirf 3 honge.
+Test mein fakeRepo sirf 3 methods implement karega — simpler.
+
+Go proverb: "Accept interfaces, return structs."
+Consumer (service) accepts interface.
+Producer (repository New*) returns concrete struct (as interface).
+```
+
+---
+
+### Go Gotchas in Stage 5
+
+| Gotcha | Explanation |
+|---|---|
+| `First()` vs `Find()` | `First()` returns `ErrRecordNotFound` if 0 rows. `Find()` returns empty slice silently. Use First for single-row lookups. |
+| `Save()` overwrites zero-values | GORM `Save(&struct)` writes ALL fields. Use `Updates(map)` for partial updates. |
+| UPDATE `RowsAffected == 0` | GORM doesn't error on "no rows updated". Check manually. |
+| `WithContext` miss karna | Query won't respect deadlines → goroutine leak under load. |
+| `AutoMigrate` in production | AutoMigrate never drops columns. Safe for dev. In prod, use proper migration files (goose / migrate). |
+| Multiple goroutines calling `close()` | If two goroutines both close the same channel → PANIC. Producer (Scheduler) owns close. |
+
+---
+
+### Self-check Questions
+
+1. **Interface service mein define kyun karna chahiye — repository mein kyun nahi?** Go proverb kya hai?
+
+2. **`gorm.ErrRecordNotFound` ko `domain.ErrNotFound` mein kyun translate karte hain?** Agar nahi karein toh kya toota?
+
+3. **`Updates(map)` vs `Save(struct)` — kab kaunsa use karein?**
+
+4. **`RowsAffected == 0` check kyun karna padta hai UPDATE queries mein?** SELECT mein kyun nahi?
+
+5. **Connection pool mein `ConnMaxLifetime` kyun set kiya? Bina iske kya problem hoti?**
+
+---
+
+### What's next — Stage 6
+
+Result Handler + Service layer:
+- `internal/monitor/result_handler.go` — `outcomes` channel drain karna, Check save karna, Incident open/close karna
+- `internal/service/` — business logic layer (MonitorService)
+- Full pipeline wire in `main.go`: Scheduler + Pool + ResultHandler sab ek saath

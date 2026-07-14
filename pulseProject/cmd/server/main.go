@@ -24,6 +24,7 @@ import (
 
 	// Our own packages — note they are BELOW cmd/ in the dependency tree.
 	"github.com/nishantks908/pulse/config"
+	"github.com/nishantks908/pulse/internal/platform/database" // DB connect + AutoMigrate
 )
 
 func main() {
@@ -36,7 +37,26 @@ func main() {
 	// Node.js: const config = require('./config')
 	cfg := config.Load()
 
-	// ── 2. ROUTER ────────────────────────────────────────────────────────────
+	// ── 2. DATABASE ──────────────────────────────────────────────────────────
+	// Connect to Postgres and run AutoMigrate to sync the schema.
+	// We crash fast on failure — no DB means the whole service is broken.
+	//
+	// Python: engine = create_engine(cfg.database_url); Base.metadata.create_all(engine)
+	// Node.js: await sequelize.authenticate(); await sequelize.sync({ alter: true })
+	db, err := database.Connect(cfg.DatabaseURL)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "db connect: %v\n", err)
+		os.Exit(1)
+	}
+	if err := database.AutoMigrate(db); err != nil {
+		fmt.Fprintf(os.Stderr, "db migrate: %v\n", err)
+		os.Exit(1)
+	}
+	fmt.Println("✅ Database connected and migrated")
+	// db is passed to repositories in later stages — keep it in scope.
+	_ = db
+
+	// ── 4. ROUTER ────────────────────────────────────────────────────────────
 	// chi.NewRouter() creates a new HTTP mux (multiplexer).
 	// It routes incoming HTTP requests to the right handler function.
 	//
@@ -45,7 +65,7 @@ func main() {
 	// Node.js/Express:  const app = express()
 	r := chi.NewRouter()
 
-	// ── 3. GLOBAL MIDDLEWARE ─────────────────────────────────────────────────
+	// ── 5. MIDDLEWARE ────────────────────────────────────────────────────────
 	// r.Use() registers middleware that runs for EVERY request.
 	// Middleware forms a chain: Request → MW1 → MW2 → Handler → MW2 → MW1 → Response
 	// (each middleware can run code both before AND after the handler)
@@ -68,7 +88,7 @@ func main() {
 	// Node.js: uncaughtException or express-async-errors handles this.
 	r.Use(chiMW.Recoverer)
 
-	// ── 4. ROUTES ────────────────────────────────────────────────────────────
+	// ── 6. ROUTES ────────────────────────────────────────────────────────────
 	// r.Get(path, handlerFunc) maps GET requests to a function.
 	//
 	// Handler signature in Go is ALWAYS:
@@ -88,7 +108,7 @@ func main() {
 	// r.Post("/auth/login",    authHandler.Login)
 	// r.Route("/monitors", func(r chi.Router) { ... })
 
-	// ── 5. HTTP SERVER ───────────────────────────────────────────────────────
+	// ── 7. HTTP SERVER ───────────────────────────────────────────────────────
 	// We create *http.Server explicitly (instead of http.ListenAndServe())
 	// because only an explicit *http.Server gives us the Shutdown() method
 	// for graceful termination.
@@ -107,7 +127,7 @@ func main() {
 		IdleTimeout:  60 * time.Second, // max time a keep-alive connection may sit idle
 	}
 
-	// ── 6. START SERVER (non-blocking) ───────────────────────────────────────
+	// ── 8. START SERVER (non-blocking) ───────────────────────────────────────
 	// We start the server in a goroutine so main() can continue to the
 	// signal-listening code below.
 	//
@@ -137,7 +157,7 @@ func main() {
 		}
 	}()
 
-	// ── 7. WAIT FOR SHUTDOWN SIGNAL ──────────────────────────────────────────
+	// ── 9. WAIT FOR SHUTDOWN SIGNAL ──────────────────────────────────────────
 	// The server is running in the goroutine above.
 	// Now main() waits here until the OS sends SIGTERM or SIGINT.
 	//
@@ -162,7 +182,7 @@ func main() {
 
 	fmt.Println("\n⏳ Shutting down (max 10s)…")
 
-	// ── 8. GRACEFUL SHUTDOWN ─────────────────────────────────────────────────
+	// ── 10. GRACEFUL SHUTDOWN ─────────────────────────────────────────────────
 	// context.WithTimeout creates a Context that auto-cancels after 10 seconds.
 	// We pass this to Shutdown(), which means:
 	//   - Stop accepting NEW connections immediately.
